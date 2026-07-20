@@ -10,19 +10,25 @@ select them in Photos together with one photo whose date is known good, and
 this function sets every other selected photo to the reference photo's
 date/time, spaced out by a fixed delta per photo so they keep a stable order.
 
-Photos does NOT report the selection in the order you clicked -- it returns
-library order -- so "first selected" is ambiguous. By default the reference is
-the first photo Photos reports; to be certain, name it explicitly:
+By default the reference is the OLDEST selected photo (earliest current
+date/time): when a bug stamps a batch with too-new dates, the one photo whose
+date survived intact is the oldest of the batch. To pick the reference
+yourself, name it explicitly:
 
     TIMEWARP_REF="IMG_1234.jpg" osxphotos timewarp \
         --function timewarp_from_reference.py::get_date_time_timezone --verbose
 
 Configuration (environment variables):
 
-    TIMEWARP_REF    Filename ("IMG_1234.jpg", extension optional) or UUID of
-                    the reference photo; must be one of the selected photos.
-                    Default: the first photo of the selection as reported by
-                    Photos (library order, not click order).
+    TIMEWARP_REF    Which selected photo is the reference:
+                    - unset or "oldest" (default): the photo with the earliest
+                      date; ties go to the first as reported by Photos
+                    - "first": the first photo of the selection as reported by
+                      Photos -- that is library order, NOT the order you
+                      clicked, so use with care
+                    - anything else: filename ("IMG_1234.jpg", extension
+                      optional) or UUID of the reference photo (if a photo is
+                      literally named "oldest" or "first", use its UUID)
 
     TIMEWARP_DELTA  Spacing between successive photos: "1s" (default), "0",
                     "90" (plain numbers are seconds), "2m", "1h30m", "1d",
@@ -32,7 +38,8 @@ Configuration (environment variables):
                     reference date/time.
 
     TIMEWARP_ORDER  Order in which the delta increments are handed out:
-                    "filename" (default, natural sort so IMG_2 < IMG_10) or
+                    "filename" (default, natural sort so IMG_2 < IMG_10),
+                    "date" (the photos' current, pre-fix date order), or
                     "selection" (the order Photos reports the selection).
 
 The reference photo itself is written back unchanged. Timezones are left
@@ -40,7 +47,9 @@ untouched for every photo; chain `osxphotos timewarp --timezone` afterwards if
 those need fixing too. The selection is snapshotted on the first call and all
 new dates are computed up front, keyed by photo UUID, so the order in which
 timewarp walks the photos does not matter -- but don't change the selection
-while it runs.
+while it runs. In "oldest" and "date" modes every selected photo's date is
+read up front, so a selection of thousands takes a while before the first
+change appears.
 
 Run `python3 timewarp_from_reference.py` for offline self-tests (safe on any
 machine; does not touch Photos).
@@ -131,14 +140,23 @@ def _plan_from_selection(selection: List["Photo"], verbose: Callable) -> _Plan:
         raise ValueError("no photos selected in Photos")
 
     ref_spec = os.environ.get(REF_ENV, "").strip()
-    if ref_spec:
-        ref = _find_reference(selection, ref_spec)
-    else:
+    spec_l = ref_spec.lower()
+    if not spec_l or spec_l == "oldest":
+        dated = [photo for photo in selection if photo.date is not None]
+        if not dated:
+            raise ValueError("none of the selected photos has a date")
+        ref = min(dated, key=lambda photo: photo.date)
+        verbose(
+            f"Using the oldest selected photo as reference: {ref.filename} at {ref.date}"
+        )
+    elif spec_l == "first":
         ref = selection[0]
         verbose(
-            f"{REF_ENV} not set; using the first photo of the selection as "
+            f"{REF_ENV}=first: using the first photo of the selection as "
             f"reported by Photos (library order, not click order): {ref.filename}"
         )
+    else:
+        ref = _find_reference(selection, ref_spec)
 
     if ref.date is None:
         raise ValueError(f"reference photo {ref.filename} has no date")
@@ -147,9 +165,17 @@ def _plan_from_selection(selection: List["Photo"], verbose: Callable) -> _Plan:
     targets = [photo for photo in selection if photo.uuid != ref.uuid]
     if order == "filename":
         targets.sort(key=lambda photo: _natural_key(photo.filename or ""))
+    elif order == "date":
+        targets.sort(
+            key=lambda photo: (
+                photo.date is None,
+                photo.date or datetime.min,
+                _natural_key(photo.filename or ""),
+            )
+        )
     elif order != "selection":
         raise ValueError(
-            f'invalid {ORDER_ENV} value {order!r} (use "filename" or "selection")'
+            f'invalid {ORDER_ENV} value {order!r} (use "filename", "date" or "selection")'
         )
 
     delta = parse_delta(os.environ.get(DELTA_ENV, "").strip() or DEFAULT_DELTA)
@@ -222,21 +248,53 @@ if __name__ == "__main__":
     assert _natural_key("IMG_10.jpg") > _natural_key("IMG_2.jpg")
 
     ref_date = datetime(2024, 6, 1, 12, 0, 0)
+    # filename order: IMG_0002 (b) before IMG_0010 (a); current-date order: a, b
     selection = [
-        fake("uuid-b", "IMG_0002.jpg", datetime(2025, 12, 24, 3, 0, 0)),
+        fake("uuid-b", "IMG_0002.jpg", datetime(2025, 12, 24, 4, 0, 0)),
         fake("uuid-r", "IMG_1234.jpg", ref_date),
-        fake("uuid-a", "IMG_0010.jpg", datetime(2025, 12, 24, 4, 0, 0)),
+        fake("uuid-a", "IMG_0010.jpg", datetime(2025, 12, 24, 3, 0, 0)),
     ]
 
-    os.environ[REF_ENV] = "img_1234"  # stem match, case-insensitive
-    os.environ.pop(DELTA_ENV, None)
-    os.environ.pop(ORDER_ENV, None)
+    def clear_env() -> None:
+        for var in (REF_ENV, DELTA_ENV, ORDER_ENV):
+            os.environ.pop(var, None)
+
+    clear_env()  # defaults: reference is the oldest photo, 1s delta, filename order
     plan = _plan_from_selection(selection, quiet)
     assert plan.ref_uuid == "uuid-r"
     assert plan.new_dates == {
         "uuid-b": ref_date + timedelta(seconds=1),  # IMG_0002 sorts before IMG_0010
         "uuid-a": ref_date + timedelta(seconds=2),
     }
+
+    # photos without a date are skipped when picking the oldest, sort last by filename
+    plan = _plan_from_selection(selection + [fake("uuid-n", "IMG_none.jpg", None)], quiet)
+    assert plan.ref_uuid == "uuid-r"
+    assert plan.new_dates["uuid-n"] == ref_date + timedelta(seconds=3)
+
+    try:
+        _plan_from_selection([fake("uuid-n", "IMG_none.jpg", None)], quiet)
+    except ValueError as err:
+        assert "has a date" in str(err)
+    else:
+        raise AssertionError("expected ValueError when no selected photo has a date")
+
+    # a tie for oldest goes to the first as reported by Photos
+    tied = datetime(2025, 1, 1, 0, 0, 0)
+    plan = _plan_from_selection([fake("t1", "b.jpg", tied), fake("t2", "a.jpg", tied)], quiet)
+    assert plan.ref_uuid == "t1"
+
+    os.environ[REF_ENV] = "oldest"
+    plan = _plan_from_selection(selection, quiet)
+    assert plan.ref_uuid == "uuid-r"
+
+    os.environ[REF_ENV] = "first"
+    plan = _plan_from_selection(selection, quiet)
+    assert plan.ref_uuid == "uuid-b"
+
+    os.environ[REF_ENV] = "img_1234"  # stem match, case-insensitive
+    plan = _plan_from_selection(selection, quiet)
+    assert plan.ref_uuid == "uuid-r"
 
     os.environ[DELTA_ENV] = "0"
     plan = _plan_from_selection(selection, quiet)
@@ -250,11 +308,22 @@ if __name__ == "__main__":
         "uuid-a": ref_date + timedelta(minutes=2),
     }
 
-    os.environ.pop(REF_ENV, None)
-    os.environ.pop(ORDER_ENV, None)
+    os.environ[ORDER_ENV] = "date"  # a (03:00) is older than b (04:00)
     plan = _plan_from_selection(selection, quiet)
-    assert plan.ref_uuid == "uuid-b"  # first as reported when TIMEWARP_REF unset
+    assert plan.new_dates == {
+        "uuid-a": ref_date + timedelta(minutes=1),
+        "uuid-b": ref_date + timedelta(minutes=2),
+    }
 
+    os.environ[ORDER_ENV] = "bogus"
+    try:
+        _plan_from_selection(selection, quiet)
+    except ValueError as err:
+        assert "bogus" in str(err)
+    else:
+        raise AssertionError("expected ValueError for invalid TIMEWARP_ORDER")
+
+    clear_env()
     os.environ[REF_ENV] = "nope.jpg"
     try:
         _plan_from_selection(selection, quiet)
