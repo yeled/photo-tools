@@ -30,6 +30,7 @@ the command.
 | `TIMEWARP_DELTA` | `1s` | Spacing per photo: `0` (identical times), `90` (plain numbers are seconds), `2m`, `1h30m`, `1d`, `-10s`, ... |
 | `TIMEWARP_ORDER` | `filename` | Order the increments are handed out in: `filename` (natural sort, so `IMG_2` < `IMG_10`), `date` (current, pre-fix date order), or `selection` (as Photos reports it). |
 | `TIMEWARP_READER` | `db` | `db` reads dates/filenames straight from the Photos library database via osxphotos (fast, no per-photo AppleScript), falling back to AppleScript automatically if the database can't be used; `applescript` forces the slow per-photo reads. |
+| `TIMEWARP_UUID_FILE` | – | Path to a file of photo UUIDs (one per line, `#` comments ignored — the format `graph_photo_dates.py --uuid-file` writes). When set, these photos are the working set instead of the Photos selection: pair it with `timewarp --uuid-from-file` on the same file and nothing needs to be selected at all. |
 
 Notes:
 
@@ -49,3 +50,37 @@ Notes:
   reference date.
 - `python3 timewarp_from_reference.py` runs offline self-tests (safe on any
   machine; does not touch Photos).
+
+## graph_photo_dates.py
+
+ASCII histogram of the dates in your Photos library, for spotting bulk
+bad-date spikes — a batch of photos all stamped with the same wrong day (like
+the Dec 24/25 export bug) shows up as one huge bar. Read-only: everything
+comes from the library database via osxphotos, no AppleScript, nothing is
+modified. Output is plain deterministic text, so you can save a run and diff
+it against a later one.
+
+```sh
+osxphotos run graph_photo_dates.py                        # monthly overview + top spike days
+osxphotos run graph_photo_dates.py --bucket day --year 2025
+osxphotos run graph_photo_dates.py --day 2025-12-24 --uuid-file spike.txt
+```
+
+`--day` lists every photo on that day (time, filename, import date, UUID) and
+`--uuid-file` writes the UUIDs, one per line. From there, without selecting
+anything in Photos:
+
+```sh
+# collect them into an album you can open in Photos.app
+osxphotos query --uuid-from-file spike.txt --add-to-album "Spike 2025-12-24"
+
+# or fix their dates directly (oldest photo becomes the reference)
+TIMEWARP_UUID_FILE=spike.txt osxphotos timewarp --uuid-from-file spike.txt \
+    --function timewarp_from_reference.py::get_date_time_timezone --verbose
+```
+
+Other flags: `--field added` graphs import (added) dates instead of photo
+dates, `--log` log-scales the bars so normal months stay visible next to a
+giant spike, `--top N` sizes the spike-day list, `--from`/`--to` restrict the
+range, `--library PATH` reads another library, and `--selftest` runs the
+offline tests (safe on any machine).
