@@ -29,13 +29,18 @@ the command.
 | `TIMEWARP_REF` | `oldest` | Which photo is the reference: `oldest` (earliest date, ties go to the first Photos reports), `first` (first as Photos reports the selection — **library order, not the order you clicked**), or a filename (`IMG_1234.jpg`, extension optional) / UUID. |
 | `TIMEWARP_DELTA` | `1s` | Spacing per photo: `0` (identical times), `90` (plain numbers are seconds), `2m`, `1h30m`, `1d`, `-10s`, ... |
 | `TIMEWARP_ORDER` | `filename` | Order the increments are handed out in: `filename` (natural sort, so `IMG_2` < `IMG_10`), `date` (current, pre-fix date order), or `selection` (as Photos reports it). |
+| `TIMEWARP_READER` | `db` | `db` reads dates/filenames straight from the Photos library database via osxphotos (fast, no per-photo AppleScript), falling back to AppleScript automatically if the database can't be used; `applescript` forces the slow per-photo reads. |
 
 Notes:
 
 - Try it on two or three photos first; `osxphotos timewarp --inspect` prints
   current values without changing anything.
-- `oldest` and `date` modes read every selected photo's date before starting,
-  so a selection of thousands takes a while before the first change appears.
+- AppleScript is used for exactly one read here — asking Photos which photos
+  are selected (a single bulk call); dates and filenames come from the library
+  database. Loading that database takes a moment on very large libraries, then
+  the plan is instant. `timewarp` itself still writes the new dates back one
+  photo at a time via AppleScript — that's the remaining slow part, and it
+  lives in osxphotos, not in this script.
 - Timezones are left untouched; chain `osxphotos timewarp --timezone ...` if
   those need fixing too.
 - If your filenames contain the full original date/time, also look at
