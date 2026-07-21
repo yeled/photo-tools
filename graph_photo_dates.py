@@ -10,6 +10,15 @@ Read-only: everything comes from the Photos library database via osxphotos --
 no AppleScript, and nothing is modified. Output is plain deterministic text,
 so runs can be saved and diffed over time.
 
+Note the database holds MORE than the library grid shows: hidden photos,
+shared-album photos, and "Shared with You" items that Messages feeds into
+Photos without them ever being saved to the library (those keep their original
+EXIF dates, so they scatter across history). Such photos are invisible to
+AppleScript, which is why `osxphotos show UUID` says "could not find asset"
+for them and timewarp cannot address them. The drill-down flags each one
+(e.g. [shared-with-you], [hidden]), --uuid-file writes them commented out so
+downstream commands skip them, and --visible-only excludes them everywhere.
+
 Run it with osxphotos' own Python so the package is importable:
 
     osxphotos run graph_photo_dates.py                       # monthly overview + top spike days
@@ -49,12 +58,50 @@ DEFAULT_TOP = 15
 SCRIPT = "graph_photo_dates.py"
 
 
+# reasons a photo does not appear in the main library grid (and so cannot be
+# addressed via AppleScript by osxphotos show / timewarp); "missing" is not one
+VISIBILITY_FLAGS = ("shared-with-you", "hidden", "shared-album", "trash")
+
+
 @dataclass
 class PhotoRow:
     uuid: str
     filename: str
     date: Optional[datetime]
     date_added: Optional[datetime]
+    flags: Tuple[str, ...] = ()
+
+
+def photo_flags(photo) -> Tuple[str, ...]:
+    """Classify why a PhotoInfo may not be where you expect it.
+
+    getattr guards keep this working across osxphotos versions that predate
+    some of the properties."""
+    flags = []
+    if getattr(photo, "syndicated", None) and not getattr(photo, "saved_to_library", True):
+        flags.append("shared-with-you")
+    if getattr(photo, "hidden", False):
+        flags.append("hidden")
+    if getattr(photo, "shared", False):
+        flags.append("shared-album")
+    if getattr(photo, "intrash", False):
+        flags.append("trash")
+    if getattr(photo, "ismissing", False):
+        flags.append("missing")
+    return tuple(flags)
+
+
+def uuid_file_lines(items: List[Tuple["PhotoRow", datetime]]) -> List[str]:
+    """UUID-file body: photos AppleScript can't address are commented out so
+    `--uuid-from-file` consumers skip them."""
+    lines = []
+    for row, _ in items:
+        unaddressable = [flag for flag in row.flags if flag in VISIBILITY_FLAGS]
+        if unaddressable:
+            lines.append(f"# {row.uuid}  ({', '.join(unaddressable)} -- not addressable in Photos)")
+        else:
+            lines.append(row.uuid)
+    return lines
 
 
 def parse_day(text: str) -> date:
@@ -137,6 +184,7 @@ def load_photos(library: Optional[str]) -> Tuple[str, List[PhotoRow]]:
             filename=photo.original_filename or photo.filename or "",
             date=photo.date,
             date_added=photo.date_added,
+            flags=photo_flags(photo),
         )
         for photo in db.photos()
     ]
@@ -185,6 +233,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TOP,
         help=f"how many spike days to list under the chart (default {DEFAULT_TOP}, 0 to disable)",
     )
+    parser.add_argument(
+        "--visible-only",
+        action="store_true",
+        help="only photos visible in the main library grid (exclude hidden, "
+        "shared-album, and unsaved Shared-with-You items)",
+    )
     parser.add_argument("--log", action="store_true", help="log-scale the bars")
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH, help="bar width in characters")
     parser.add_argument("--library", metavar="PATH", help="path to a Photos library (default: last opened)")
@@ -206,14 +260,34 @@ def drill_down(
     name_w = min(36, max(len(row.filename) for row, _ in items))
     for row, dt in items:
         added = row.date_added.date().isoformat() if row.date_added else "-"
-        print(f"{dt:%H:%M:%S}  {row.filename:<{name_w}}  added {added}  {row.uuid}")
-    print(f"\nReveal one in Photos.app:  osxphotos show {items[0][0].uuid}")
+        flag_str = f"  [{', '.join(row.flags)}]" if row.flags else ""
+        print(f"{dt:%H:%M:%S}  {row.filename:<{name_w}}  added {added}  {row.uuid}{flag_str}")
+    addressable = [
+        (row, dt)
+        for row, dt in items
+        if not any(flag in VISIBILITY_FLAGS for flag in row.flags)
+    ]
+    if len(addressable) < len(items):
+        print(
+            f"\n{len(items) - len(addressable):,} of these are outside the main library "
+            "grid (see flags) -- osxphotos show/timewarp cannot address those."
+        )
+    if addressable:
+        print(f"\nReveal one in Photos.app:  osxphotos show {addressable[0][0].uuid}")
     if uuid_file:
         with open(uuid_file, "w") as fh:
             fh.write(f"# {len(items)} photos dated {day.isoformat()} (field: {field})\n")
-            for row, _ in items:
-                fh.write(row.uuid + "\n")
-        print(f"\nWrote {len(items):,} UUID(s) to {uuid_file}. Next steps:")
+            for line in uuid_file_lines(items):
+                fh.write(line + "\n")
+        print(
+            f"\nWrote {len(addressable):,} usable UUID(s) to {uuid_file}"
+            + (
+                f" ({len(items) - len(addressable):,} unaddressable ones commented out)"
+                if len(addressable) < len(items)
+                else ""
+            )
+            + ". Next steps:"
+        )
         print(
             f'  osxphotos query --uuid-from-file {uuid_file} '
             f'--add-to-album "Spike {day.isoformat()}"'
@@ -273,6 +347,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             continue
         if args.to_date and day > args.to_date:
             continue
+        if args.visible_only and any(flag in VISIBILITY_FLAGS for flag in row.flags):
+            continue
         pairs.append((row, dt))
 
     if undated:
@@ -282,7 +358,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     first = min(dt for _, dt in pairs).date().isoformat()
     last = max(dt for _, dt in pairs).date().isoformat()
-    print(f"{len(pairs):,} photo(s) from {first} to {last} (field: {args.field})\n")
+    print(f"{len(pairs):,} photo(s) from {first} to {last} (field: {args.field})")
+    flag_totals = Counter(flag for row, _ in pairs for flag in row.flags)
+    if flag_totals:
+        summary = ", ".join(
+            f"{count:,} {flag}" for flag, count in sorted(flag_totals.items(), key=lambda kv: -kv[1])
+        )
+        print(f"Flagged in range: {summary}")
+        print(
+            "(all but 'missing' live outside the main library grid -- invisible "
+            "to osxphotos show/timewarp; --visible-only excludes them)"
+        )
+    print()
 
     if args.day:
         drill_down([(row, dt) for row, dt in pairs if dt.date() == args.day],
@@ -333,6 +420,31 @@ def selftest() -> None:
     row = PhotoRow("U", "f.jpg", datetime(2025, 1, 1), None)
     assert field_datetime(row, "date") == datetime(2025, 1, 1)
     assert field_datetime(row, "added") is None
+
+    from types import SimpleNamespace
+
+    unsaved = SimpleNamespace(
+        syndicated=True, saved_to_library=False, hidden=False,
+        shared=False, intrash=False, ismissing=False,
+    )
+    assert photo_flags(unsaved) == ("shared-with-you",)
+    saved = SimpleNamespace(
+        syndicated=True, saved_to_library=True, hidden=True,
+        shared=True, intrash=False, ismissing=True,
+    )
+    assert photo_flags(saved) == ("hidden", "shared-album", "missing")
+    assert photo_flags(SimpleNamespace()) == ()  # older osxphotos: no such attrs
+
+    when = datetime(2025, 1, 1)
+    items = [
+        (PhotoRow("U1", "a.jpg", when, None, ("shared-with-you",)), when),
+        (PhotoRow("U2", "b.jpg", when, None, ()), when),
+        (PhotoRow("U3", "c.jpg", when, None, ("missing",)), when),
+    ]
+    lines = uuid_file_lines(items)
+    assert lines[0].startswith("# U1") and "shared-with-you" in lines[0]
+    assert lines[1] == "U2"
+    assert lines[2] == "U3"  # missing originals are still addressable in Photos
 
     print("selftest OK")
 

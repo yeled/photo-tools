@@ -79,6 +79,16 @@ TIMEWARP_UUID_FILE=spike.txt osxphotos timewarp --uuid-from-file spike.txt \
     --function timewarp_from_reference.py::get_date_time_timezone --verbose
 ```
 
+Note: the library **database holds more than the library grid shows** —
+hidden photos, shared-album photos, and "Shared with You" items that Messages
+feeds into Photos without them ever being saved to your library (they keep
+their original EXIF dates, so they scatter across history). Those are
+invisible to AppleScript, which is why `osxphotos show UUID` reports "could
+not find asset" for them. The drill-down flags each such photo (e.g.
+`[shared-with-you]`, `[hidden]`), `--uuid-file` writes them commented out so
+`--uuid-from-file` consumers skip them, and `--visible-only` excludes them
+from all output.
+
 Other flags: `--field added` graphs import (added) dates instead of photo
 dates, `--log` log-scales the bars so normal months stay visible next to a
 giant spike, `--top N` sizes the spike-day list, `--from`/`--to` restrict the
