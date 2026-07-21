@@ -92,5 +92,7 @@ from all output.
 Other flags: `--field added` graphs import (added) dates instead of photo
 dates, `--log` log-scales the bars so normal months stay visible next to a
 giant spike, `--top N` sizes the spike-day list, `--from`/`--to` restrict the
-range, `--library PATH` reads another library, and `--selftest` runs the
+range, `--color always|never` overrides the flag coloring (auto colors only on
+a terminal and honors `NO_COLOR`, so redirected output stays plain and
+diffable), `--library PATH` reads another library, and `--selftest` runs the
 offline tests (safe on any machine).

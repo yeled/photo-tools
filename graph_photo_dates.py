@@ -39,14 +39,18 @@ Options: --field added graphs import (added) dates instead of photo dates;
 --bucket day|month|year sets chart granularity; --year / --from / --to
 restrict the range; --top N sizes the spike-day list; --log log-scales the
 bars so normal months stay visible next to a huge spike; --width N sets bar
-width; --library PATH reads a specific library instead of the default;
---selftest runs the offline tests (safe on any machine).
+width; --color always|never overrides flag coloring (auto colors only on a
+terminal and honors NO_COLOR, so redirected output stays plain and diffable);
+--library PATH reads a specific library instead of the default; --selftest
+runs the offline tests (safe on any machine).
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import os
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -61,6 +65,32 @@ SCRIPT = "graph_photo_dates.py"
 # reasons a photo does not appear in the main library grid (and so cannot be
 # addressed via AppleScript by osxphotos show / timewarp); "missing" is not one
 VISIBILITY_FLAGS = ("shared-with-you", "hidden", "shared-album", "trash")
+
+ANSI_RESET = "\x1b[0m"
+FLAG_COLORS = {
+    "shared-with-you": "\x1b[36m",  # cyan
+    "hidden": "\x1b[33m",  # yellow
+    "shared-album": "\x1b[34m",  # blue
+    "trash": "\x1b[31m",  # red
+    "missing": "\x1b[35m",  # magenta
+}
+
+
+def color_enabled(mode: str, stream) -> bool:
+    """--color always/never wins; auto means "stream is a terminal and
+    NO_COLOR is unset", so redirected output stays plain and diffable."""
+    if mode == "always":
+        return True
+    if mode == "never" or os.environ.get("NO_COLOR"):
+        return False
+    return hasattr(stream, "isatty") and stream.isatty()
+
+
+def colorize_flag(flag: str, enabled: bool) -> str:
+    if not enabled:
+        return flag
+    color = FLAG_COLORS.get(flag)
+    return f"{color}{flag}{ANSI_RESET}" if color else flag
 
 
 @dataclass
@@ -239,6 +269,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="only photos visible in the main library grid (exclude hidden, "
         "shared-album, and unsaved Shared-with-You items)",
     )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="color the annotation flags (default auto: only on a terminal, "
+        "honoring NO_COLOR)",
+    )
     parser.add_argument("--log", action="store_true", help="log-scale the bars")
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH, help="bar width in characters")
     parser.add_argument("--library", metavar="PATH", help="path to a Photos library (default: last opened)")
@@ -251,6 +288,7 @@ def drill_down(
     day: date,
     field: str,
     uuid_file: Optional[str],
+    color: bool = False,
 ) -> None:
     if not items:
         print(f"No photos on {day.isoformat()} (field: {field}).")
@@ -260,7 +298,11 @@ def drill_down(
     name_w = min(36, max(len(row.filename) for row, _ in items))
     for row, dt in items:
         added = row.date_added.date().isoformat() if row.date_added else "-"
-        flag_str = f"  [{', '.join(row.flags)}]" if row.flags else ""
+        flag_str = (
+            f"  [{', '.join(colorize_flag(flag, color) for flag in row.flags)}]"
+            if row.flags
+            else ""
+        )
         print(f"{dt:%H:%M:%S}  {row.filename:<{name_w}}  added {added}  {row.uuid}{flag_str}")
     addressable = [
         (row, dt)
@@ -359,10 +401,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     first = min(dt for _, dt in pairs).date().isoformat()
     last = max(dt for _, dt in pairs).date().isoformat()
     print(f"{len(pairs):,} photo(s) from {first} to {last} (field: {args.field})")
+    color = color_enabled(args.color, sys.stdout)
     flag_totals = Counter(flag for row, _ in pairs for flag in row.flags)
     if flag_totals:
         summary = ", ".join(
-            f"{count:,} {flag}" for flag, count in sorted(flag_totals.items(), key=lambda kv: -kv[1])
+            f"{count:,} {colorize_flag(flag, color)}"
+            for flag, count in sorted(flag_totals.items(), key=lambda kv: -kv[1])
         )
         print(f"Flagged in range: {summary}")
         print(
@@ -373,7 +417,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.day:
         drill_down([(row, dt) for row, dt in pairs if dt.date() == args.day],
-                   args.day, args.field, args.uuid_file)
+                   args.day, args.field, args.uuid_file, color)
     else:
         overview(pairs, args)
     return 0
@@ -445,6 +489,25 @@ def selftest() -> None:
     assert lines[0].startswith("# U1") and "shared-with-you" in lines[0]
     assert lines[1] == "U2"
     assert lines[2] == "U3"  # missing originals are still addressable in Photos
+
+    assert colorize_flag("hidden", False) == "hidden"
+    assert colorize_flag("hidden", True) == f"\x1b[33mhidden{ANSI_RESET}"
+    assert colorize_flag("unknown-flag", True) == "unknown-flag"
+    tty = SimpleNamespace(isatty=lambda: True)
+    pipe = SimpleNamespace(isatty=lambda: False)
+    no_color_before = os.environ.pop("NO_COLOR", None)
+    try:
+        assert color_enabled("always", pipe) is True
+        assert color_enabled("never", tty) is False
+        assert color_enabled("auto", tty) is True
+        assert color_enabled("auto", pipe) is False
+        os.environ["NO_COLOR"] = "1"
+        assert color_enabled("auto", tty) is False
+        assert color_enabled("always", tty) is True
+    finally:
+        os.environ.pop("NO_COLOR", None)
+        if no_color_before is not None:
+            os.environ["NO_COLOR"] = no_color_before
 
     print("selftest OK")
 
