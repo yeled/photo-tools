@@ -48,8 +48,9 @@ Notes:
   `osxphotos timewarp --parse-date DATE_PATTERN` (strptime pattern) — it can
   restore each photo's own true date instead of flattening a batch to one
   reference date.
-- `python3 timewarp_from_reference.py` runs offline self-tests (safe on any
-  machine; does not touch Photos).
+- `python3 timewarp_from_reference.py --help` (or a bare run) prints CLI
+  usage including the environment-variable reference; `--selftest` runs the
+  offline self-tests (safe on any machine; does not touch Photos).
 
 ### Direct apply mode (PhotoKit) — no timewarp, no selection
 

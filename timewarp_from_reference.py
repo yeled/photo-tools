@@ -94,8 +94,8 @@ timewarp walks the photos does not matter -- but don't change the selection
 while it runs. Loading the library database takes a moment for very large
 libraries; after that the plan is instant.
 
-Run `python3 timewarp_from_reference.py` for offline self-tests (safe on any
-machine; does not touch Photos).
+Run with --help (or no arguments) for CLI usage; --selftest runs the offline
+self-tests (safe on any machine; does not touch Photos).
 """
 
 from __future__ import annotations
@@ -407,14 +407,38 @@ def get_date_time_timezone(
 def _cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="timewarp_from_reference.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Copy the date/time of a reference photo to the other "
         "photos, writing directly via PhotoKit (or AppleScript) -- no "
         "timewarp, no Photos selection needed. Dry run unless --apply is "
-        "given. Run with no arguments at all to execute the offline "
-        "self-tests instead.",
-        epilog="The TIMEWARP_REF/TIMEWARP_DELTA/TIMEWARP_ORDER/"
-        "TIMEWARP_UUID_FILE environment variables are honored as defaults "
-        "for the corresponding options.",
+        "given; run with no arguments to print this help.",
+        epilog="""\
+environment variables (defaults for the matching options; CLI wins):
+  TIMEWARP_REF        reference photo: "oldest" (default), "first",
+                      a filename, or a UUID
+  TIMEWARP_DELTA      spacing per photo: "1s" (default), "0", "90" (seconds),
+                      "2m", "1h30m", "1d", "-10s"
+  TIMEWARP_ORDER      "filename" (default, natural sort), "date", or
+                      "selection" (= file order when using a UUID file)
+  TIMEWARP_READER     metadata reads: "db" (default) or "applescript"
+  TIMEWARP_UUID_FILE  same as --uuid-file
+
+examples:
+  # inside timewarp (timewarp does the writing, via AppleScript):
+  osxphotos timewarp \\
+      --function timewarp_from_reference.py::get_date_time_timezone --verbose
+
+  # direct: dry-run a UUID file from graph_photo_dates.py, then write:
+  osxphotos run timewarp_from_reference.py --uuid-file spike.txt
+  osxphotos run timewarp_from_reference.py --uuid-file spike.txt --apply
+
+  # revert either engine's writes back to import-time originals:
+  osxphotos timewarp --reset --uuid-from-file spike.txt
+
+if `osxphotos run timewarp_from_reference.py --help` shows osxphotos' own
+help instead of this, run it with no arguments or use
+`python3 timewarp_from_reference.py --help`.
+""",
     )
     parser.add_argument(
         "--uuid-file",
@@ -526,9 +550,13 @@ def _apply_applescript(
 
 
 def cli_main(argv: Optional[List[str]] = None) -> int:
-    args = _cli_parser().parse_args(argv)
+    parser = _cli_parser()
+    args = parser.parse_args(argv)
     if args.selftest:
         _selftest()
+        return 0
+    if not argv:
+        parser.print_help()
         return 0
     _apply_cli_env(args)
 
@@ -738,7 +766,4 @@ def _selftest() -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 1:
-        _selftest()  # bare run stays the documented self-test entry point
-        raise SystemExit(0)
     raise SystemExit(cli_main(sys.argv[1:]))

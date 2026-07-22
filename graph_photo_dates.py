@@ -228,8 +228,28 @@ def field_datetime(row: PhotoRow, field: str) -> Optional[datetime]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=SCRIPT,
-        description="ASCII histogram of Photos library dates; see the module "
-        "docstring for the full workflow.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="ASCII histogram of Photos library dates, for hunting "
+        "bulk bad-date spikes. Read-only: database only, no AppleScript, "
+        "nothing modified; output is deterministic text, so save a run and "
+        "diff it later.",
+        epilog="""\
+examples:
+  osxphotos run graph_photo_dates.py                     # monthly overview + top spike days
+  osxphotos run graph_photo_dates.py --bucket day --year 2025
+  osxphotos run graph_photo_dates.py --day 2025-12-24 --uuid-file spike.txt
+
+follow-ups for a UUID file:
+  # collect them into an album you can open in Photos.app:
+  osxphotos query --uuid-from-file spike.txt --add-to-album "Spike 2025-12-24"
+  # or fix the dates directly (dry run; add --apply to write):
+  osxphotos run timewarp_from_reference.py --uuid-file spike.txt
+
+flags like [shared-with-you] or [hidden] mark photos that live outside the
+main library grid; those are invisible to AppleScript (osxphotos show /
+timewarp), are written commented-out to the UUID file, and can be excluded
+entirely with --visible-only.
+""",
     )
     parser.add_argument(
         "--field",
