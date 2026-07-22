@@ -21,7 +21,8 @@ yourself, name it explicitly:
 Dates and filenames are read straight from the Photos library database via
 osxphotos' PhotosDB (fast, no per-photo AppleScript). AppleScript is used for
 exactly one thing here: asking Photos which photos are selected (a single
-call), because the selection is UI state that lives in no database. Note that
+call), because the selection is UI state that lives in no database -- and even
+that is skipped when TIMEWARP_UUID_FILE supplies the photos. Note that
 timewarp itself still writes the new dates back one photo at a time through
 AppleScript -- that part belongs to osxphotos, not to this function.
 
@@ -57,6 +58,16 @@ Configuration (environment variables):
                     database reader finds). "applescript": force the old
                     per-photo AppleScript reads.
 
+    TIMEWARP_UUID_FILE
+                    Path to a file of photo UUIDs, one per line (lines
+                    starting with # are ignored) -- the format written by
+                    graph_photo_dates.py --uuid-file and read by timewarp's
+                    own --uuid-from-file. When set, these photos are the
+                    working set instead of the Photos selection, so nothing
+                    needs to be selected at all; point timewarp's
+                    --uuid-from-file at the same file. TIMEWARP_ORDER=
+                    "selection" then means file order.
+
 The reference photo itself is written back unchanged. Timezones are left
 untouched for every photo; chain `osxphotos timewarp --timezone` afterwards if
 those need fixing too. The selection is snapshotted on the first call and all
@@ -84,6 +95,7 @@ REF_ENV = "TIMEWARP_REF"
 DELTA_ENV = "TIMEWARP_DELTA"
 ORDER_ENV = "TIMEWARP_ORDER"
 READER_ENV = "TIMEWARP_READER"
+UUID_FILE_ENV = "TIMEWARP_UUID_FILE"
 
 DEFAULT_DELTA = "1s"
 
@@ -122,6 +134,31 @@ def _natural_key(name: str) -> List[object]:
 def _norm_uuid(raw: str) -> str:
     """AppleScript photo ids look like "UUID/L0/001"; reduce to the plain UUID."""
     return raw.split("/")[0].upper()
+
+
+def _read_uuid_file(path: str) -> List[str]:
+    """One UUID per line; blank lines and #-comments ignored (the same format
+    `osxphotos timewarp --uuid-from-file` and graph_photo_dates.py use)."""
+    uuids = []
+    with open(path) as fh:
+        for line in fh:
+            text = line.strip()
+            if text and not text.startswith("#"):
+                uuids.append(_norm_uuid(text))
+    if not uuids:
+        raise ValueError(f"no UUIDs found in {UUID_FILE_ENV}={path}")
+    return uuids
+
+
+def _target_uuids(verbose: Callable) -> List[str]:
+    """The working set: UUIDs from TIMEWARP_UUID_FILE if set, else the Photos
+    selection."""
+    uuid_file = os.environ.get(UUID_FILE_ENV, "").strip()
+    if uuid_file:
+        uuids = _read_uuid_file(uuid_file)
+        verbose(f"{UUID_FILE_ENV}: {len(uuids)} photo(s) from {uuid_file}")
+        return uuids
+    return _selected_uuids(verbose)
 
 
 @dataclass
@@ -257,7 +294,7 @@ def _records_from_photosdb(verbose: Callable) -> Optional[List[_PhotoRec]]:
     """Read the selected photos' dates/filenames from the Photos library
     database (no per-photo AppleScript). Returns None if the database cannot
     be used, so the caller can fall back to AppleScript."""
-    uuids = _selected_uuids(verbose)
+    uuids = _target_uuids(verbose)
     try:
         import osxphotos
     except ImportError as err:
@@ -294,10 +331,16 @@ def _records_from_photosdb(verbose: Callable) -> Optional[List[_PhotoRec]]:
 def _records_from_applescript(verbose: Callable) -> List[_PhotoRec]:
     import photoscript
 
+    uuid_file = os.environ.get(UUID_FILE_ENV, "").strip()
+    photos = (
+        [photoscript.Photo(uuid) for uuid in _read_uuid_file(uuid_file)]
+        if uuid_file
+        else photoscript.PhotosLibrary().selection
+    )
     verbose("reading dates via AppleScript, one photo at a time (slow on big selections)...")
     return [
         _PhotoRec(_norm_uuid(photo.uuid), photo.filename or "", photo.date)
-        for photo in photoscript.PhotosLibrary().selection
+        for photo in photos
     ]
 
 
@@ -368,6 +411,29 @@ if __name__ == "__main__":
     assert _norm_uuid("abc-123/L0/001") == "ABC-123"
     assert _norm_uuid("ABC-123") == "ABC-123"
 
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+        fh.write("# comment\n\nabc-1/L0/001\nABC-2\n")
+        uuid_path = fh.name
+    try:
+        assert _read_uuid_file(uuid_path) == ["ABC-1", "ABC-2"]
+    finally:
+        os.unlink(uuid_path)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+        fh.write("# only a comment\n")
+        uuid_path = fh.name
+    try:
+        try:
+            _read_uuid_file(uuid_path)
+        except ValueError as err:
+            assert "no UUIDs" in str(err)
+        else:
+            raise AssertionError("expected ValueError for empty uuid file")
+    finally:
+        os.unlink(uuid_path)
+
     ref_date = datetime(2024, 6, 1, 12, 0, 0)
     # filename order: IMG_0002 (b) before IMG_0010 (a); current-date order: a, b
     selection = [
@@ -377,7 +443,7 @@ if __name__ == "__main__":
     ]
 
     def clear_env() -> None:
-        for var in (REF_ENV, DELTA_ENV, ORDER_ENV, READER_ENV):
+        for var in (REF_ENV, DELTA_ENV, ORDER_ENV, READER_ENV, UUID_FILE_ENV):
             os.environ.pop(var, None)
 
     clear_env()  # defaults: reference is the oldest photo, 1s delta, filename order
