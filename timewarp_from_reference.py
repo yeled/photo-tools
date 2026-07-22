@@ -26,6 +26,24 @@ that is skipped when TIMEWARP_UUID_FILE supplies the photos. Note that
 timewarp itself still writes the new dates back one photo at a time through
 AppleScript -- that part belongs to osxphotos, not to this function.
 
+DIRECT APPLY MODE: run this file as a command and it writes the dates itself,
+no timewarp and no selection needed, Photos.app not even running:
+
+    osxphotos run timewarp_from_reference.py --uuid-file spike.txt           # dry run
+    osxphotos run timewarp_from_reference.py --uuid-file spike.txt --apply   # write
+
+The default --engine photokit writes through Apple's PhotoKit
+(PHAssetChangeRequest via RhetTbull's photokit package) -- the supported
+change API, so the edits sync to iCloud exactly like edits made by hand in
+Photos, and thousands of photos take seconds. Requires macOS >= 13.5 and
+`pipx inject osxphotos photokit` (the package is alpha; first run prompts for
+Photos library access; system default library only). --engine applescript
+writes via photoscript instead (slow, needs Photos open) if you'd rather not
+install photokit. Dry run is the default: nothing is written without --apply.
+Timezones are never touched, and `osxphotos timewarp --reset --uuid-from-file
+spike.txt` restores the import-time originals no matter which engine wrote
+the dates. --ref/--delta/--order mirror the environment variables below.
+
 Configuration (environment variables):
 
     TIMEWARP_REF    Which selected photo is the reference:
@@ -82,8 +100,10 @@ machine; does not touch Photos).
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
@@ -384,7 +404,160 @@ def get_date_time_timezone(
     return new_date, tz_sec
 
 
-if __name__ == "__main__":
+def _cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="timewarp_from_reference.py",
+        description="Copy the date/time of a reference photo to the other "
+        "photos, writing directly via PhotoKit (or AppleScript) -- no "
+        "timewarp, no Photos selection needed. Dry run unless --apply is "
+        "given. Run with no arguments at all to execute the offline "
+        "self-tests instead.",
+        epilog="The TIMEWARP_REF/TIMEWARP_DELTA/TIMEWARP_ORDER/"
+        "TIMEWARP_UUID_FILE environment variables are honored as defaults "
+        "for the corresponding options.",
+    )
+    parser.add_argument(
+        "--uuid-file",
+        metavar="PATH",
+        help="file of photo UUIDs to fix, one per line, # comments ignored "
+        "(as written by graph_photo_dates.py --uuid-file); without it the "
+        "Photos selection is used",
+    )
+    parser.add_argument(
+        "--ref",
+        metavar="REF",
+        help='reference photo: "oldest" (default), "first", a filename, or a UUID',
+    )
+    parser.add_argument("--delta", metavar="DELTA", help='spacing per photo (default "1s")')
+    parser.add_argument(
+        "--order",
+        choices=("filename", "date", "selection"),
+        help="order the delta increments are handed out in (default filename)",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=("photokit", "applescript"),
+        default="photokit",
+        help="how to write the dates: photokit (default; fast, synced, Photos "
+        "may be closed) or applescript (photoscript, slow, Photos open)",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually write the dates; without this only the plan is printed",
+    )
+    parser.add_argument("--selftest", action="store_true", help="run offline self-tests and exit")
+    return parser
+
+
+def _apply_cli_env(args: argparse.Namespace) -> None:
+    """CLI options fill the documented environment variables so planning has
+    one code path whichever way it's driven."""
+    for value, env in (
+        (args.ref, REF_ENV),
+        (args.delta, DELTA_ENV),
+        (args.order, ORDER_ENV),
+        (args.uuid_file, UUID_FILE_ENV),
+    ):
+        if value:
+            os.environ[env] = value
+
+
+def _sorted_targets(plan: _Plan) -> List[Tuple[str, datetime]]:
+    """Deterministic apply order: by new date, then uuid."""
+    return sorted(plan.new_dates.items(), key=lambda kv: (kv[1], kv[0]))
+
+
+def _dry_run_lines(plan: _Plan, targets: List[Tuple[str, datetime]]) -> List[str]:
+    name_w = min(
+        36, max((len(plan.filenames.get(uuid) or uuid) for uuid, _ in targets), default=1)
+    )
+    lines = []
+    for uuid, new_date in targets:
+        name = plan.filenames.get(uuid) or uuid
+        lines.append(f"{name:<{name_w}}  {plan.old_dates.get(uuid)} -> {new_date}")
+    return lines
+
+
+def _apply_photokit(
+    targets: List[Tuple[str, datetime]], plan: _Plan, verbose: Callable
+) -> int:
+    """Write dates via Apple's PhotoKit (PHAssetChangeRequest): the supported
+    change API, so edits sync to iCloud like edits made by hand in Photos.
+    Returns the number of failures."""
+    try:
+        from photokit import PhotoLibrary
+    except ImportError as err:
+        raise SystemExit(
+            f"photokit is not installed ({err}); install it into osxphotos' "
+            "environment, e.g.: pipx inject osxphotos photokit"
+        )
+    library = PhotoLibrary()
+    failures = 0
+    for uuid, new_date in targets:
+        name = plan.filenames.get(uuid) or uuid
+        try:
+            asset = library.fetch_uuid(uuid)
+            asset.date = new_date  # photokit expects naive local time, like our plan
+            verbose(f"{name}: {new_date}")
+        except Exception as err:  # keep going, report the tally at the end
+            failures += 1
+            verbose(f"{name}: FAILED ({err})")
+    return failures
+
+
+def _apply_applescript(
+    targets: List[Tuple[str, datetime]], plan: _Plan, verbose: Callable
+) -> int:
+    """Write dates via photoscript, one AppleScript call per photo (what
+    timewarp itself does). Photos.app must be running."""
+    import photoscript
+
+    failures = 0
+    for uuid, new_date in targets:
+        name = plan.filenames.get(uuid) or uuid
+        try:
+            photoscript.Photo(uuid).date = new_date
+            verbose(f"{name}: {new_date}")
+        except Exception as err:
+            failures += 1
+            verbose(f"{name}: FAILED ({err})")
+    return failures
+
+
+def cli_main(argv: Optional[List[str]] = None) -> int:
+    args = _cli_parser().parse_args(argv)
+    if args.selftest:
+        _selftest()
+        return 0
+    _apply_cli_env(args)
+
+    plan = _build_plan(print)
+    targets = _sorted_targets(plan)
+    print()
+    for line in _dry_run_lines(plan, targets):
+        print(line)
+    print(
+        f"\nReference {plan.ref_filename} stays at {plan.ref_date}; "
+        f"{len(targets)} photo(s) to change; timezones untouched."
+    )
+    if not args.apply:
+        print("Dry run only -- nothing written. Re-run with --apply to write.")
+        return 0
+
+    print(f"\nWriting dates via {args.engine}...")
+    engine = _apply_photokit if args.engine == "photokit" else _apply_applescript
+    failures = engine(targets, plan, print)
+    print(f"\n{len(targets) - failures:,} photo(s) updated, {failures:,} failed.")
+    if failures == 0:
+        print(
+            "Revert any time with: osxphotos timewarp --reset "
+            "(--uuid-from-file the same file, or select the photos)"
+        )
+    return 1 if failures else 0
+
+
+def _selftest() -> None:
     quiet = lambda *args, **kwargs: None  # noqa: E731
 
     def fake(uuid: str, filename: str, date: Optional[datetime]) -> _PhotoRec:
@@ -538,4 +711,34 @@ if __name__ == "__main__":
     else:
         raise AssertionError("expected ValueError for ambiguous TIMEWARP_REF")
 
+    clear_env()
+    args = _cli_parser().parse_args(
+        ["--uuid-file", "spike.txt", "--ref", "img_9", "--delta", "2m", "--order", "date"]
+    )
+    assert args.engine == "photokit" and not args.apply
+    _apply_cli_env(args)
+    assert os.environ[UUID_FILE_ENV] == "spike.txt"
+    assert os.environ[REF_ENV] == "img_9"
+    assert os.environ[DELTA_ENV] == "2m"
+    assert os.environ[ORDER_ENV] == "date"
+
+    clear_env()  # defaults again: oldest reference, 1s delta, filename order
+    plan = _plan_from_records(selection, quiet)
+    targets = _sorted_targets(plan)
+    assert targets == [
+        ("uuid-b", ref_date + timedelta(seconds=1)),
+        ("uuid-a", ref_date + timedelta(seconds=2)),
+    ]
+    lines = _dry_run_lines(plan, targets)
+    assert len(lines) == 2
+    assert lines[0].startswith("IMG_0002.jpg") and "-> 2024-06-01 12:00:01" in lines[0]
+    assert lines[1].startswith("IMG_0010.jpg") and "-> 2024-06-01 12:00:02" in lines[1]
+
     print("selftest OK")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 1:
+        _selftest()  # bare run stays the documented self-test entry point
+        raise SystemExit(0)
+    raise SystemExit(cli_main(sys.argv[1:]))
