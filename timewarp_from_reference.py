@@ -26,11 +26,15 @@ that is skipped when TIMEWARP_UUID_FILE supplies the photos. Note that
 timewarp itself still writes the new dates back one photo at a time through
 AppleScript -- that part belongs to osxphotos, not to this function.
 
-DIRECT APPLY MODE: run this file as a command and it writes the dates itself,
-no timewarp and no selection needed, Photos.app not even running:
+DIRECT APPLY MODE: run this file as a command and it plans (and, with
+--apply, writes) the dates itself, no timewarp needed. A bare run dry-runs
+against the current Photos selection; --uuid-file works on a saved list
+instead, with Photos.app not even running:
 
-    osxphotos run timewarp_from_reference.py --uuid-file spike.txt           # dry run
-    osxphotos run timewarp_from_reference.py --uuid-file spike.txt --apply   # write
+    osxphotos run timewarp_from_reference.py                                 # dry run, current selection
+    osxphotos run timewarp_from_reference.py --apply                         # write the selection
+    osxphotos run timewarp_from_reference.py --uuid-file spike.txt           # dry run, saved list
+    osxphotos run timewarp_from_reference.py --uuid-file spike.txt --apply   # write the list
 
 The default --engine photokit writes through Apple's PhotoKit
 (PHAssetChangeRequest via RhetTbull's photokit package) -- the supported
@@ -94,8 +98,9 @@ timewarp walks the photos does not matter -- but don't change the selection
 while it runs. Loading the library database takes a moment for very large
 libraries; after that the plan is instant.
 
-Run with --help (or no arguments) for CLI usage; --selftest runs the offline
-self-tests (safe on any machine; does not touch Photos).
+A bare run dry-runs against the current selection (see DIRECT APPLY MODE
+above); --help prints CLI usage; --selftest runs the offline self-tests (safe
+on any machine; does not touch Photos).
 """
 
 from __future__ import annotations
@@ -410,8 +415,9 @@ def _cli_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Copy the date/time of a reference photo to the other "
         "photos, writing directly via PhotoKit (or AppleScript) -- no "
-        "timewarp, no Photos selection needed. Dry run unless --apply is "
-        "given; run with no arguments to print this help.",
+        "timewarp needed. A bare run dry-runs against the current Photos "
+        "selection; --uuid-file uses a saved list instead. Nothing is written "
+        "without --apply.",
         epilog="""\
 environment variables (defaults for the matching options; CLI wins):
   TIMEWARP_REF        reference photo: "oldest" (default), "first",
@@ -424,20 +430,20 @@ environment variables (defaults for the matching options; CLI wins):
   TIMEWARP_UUID_FILE  same as --uuid-file
 
 examples:
-  # inside timewarp (timewarp does the writing, via AppleScript):
-  osxphotos timewarp \\
-      --function timewarp_from_reference.py::get_date_time_timezone --verbose
+  # dry-run against the current Photos selection, then write it:
+  osxphotos run timewarp_from_reference.py
+  osxphotos run timewarp_from_reference.py --apply
 
-  # direct: dry-run a UUID file from graph_photo_dates.py, then write:
+  # work on a saved UUID list from graph_photo_dates.py (Photos may be closed):
   osxphotos run timewarp_from_reference.py --uuid-file spike.txt
   osxphotos run timewarp_from_reference.py --uuid-file spike.txt --apply
 
+  # inside timewarp instead (timewarp does the writing, via AppleScript):
+  osxphotos timewarp \\
+      --function timewarp_from_reference.py::get_date_time_timezone --verbose
+
   # revert either engine's writes back to import-time originals:
   osxphotos timewarp --reset --uuid-from-file spike.txt
-
-if `osxphotos run timewarp_from_reference.py --help` shows osxphotos' own
-help instead of this, run it with no arguments or use
-`python3 timewarp_from_reference.py --help`.
 """,
     )
     parser.add_argument(
@@ -555,12 +561,18 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
     if args.selftest:
         _selftest()
         return 0
-    if not argv:
-        parser.print_help()
-        return 0
     _apply_cli_env(args)
 
-    plan = _build_plan(print)
+    # A bare run (no --uuid-file) plans a dry run against the current Photos
+    # selection -- the useful default. Use --help for usage, --selftest for
+    # the offline tests. Planning errors (nothing selected, bad --ref, ...)
+    # print cleanly instead of dumping a traceback.
+    try:
+        plan = _build_plan(print)
+    except ValueError as err:
+        print(f"error: {err}")
+        print("(select photos in Photos, or pass --uuid-file; --help for usage)")
+        return 2
     targets = _sorted_targets(plan)
     print()
     for line in _dry_run_lines(plan, targets):
@@ -761,6 +773,44 @@ def _selftest() -> None:
     assert len(lines) == 2
     assert lines[0].startswith("IMG_0002.jpg") and "-> 2024-06-01 12:00:01" in lines[0]
     assert lines[1].startswith("IMG_0010.jpg") and "-> 2024-06-01 12:00:02" in lines[1]
+
+    # cli_main control flow, with _build_plan stubbed so no Photos is needed.
+    # Regression: a bare run must DRY-RUN the plan, never print argparse help.
+    import contextlib
+    import io
+
+    fake_plan = _Plan(
+        ref_uuid="uuid-r",
+        ref_filename="IMG_1234.jpg",
+        ref_date=ref_date,
+        new_dates={"uuid-b": ref_date + timedelta(seconds=1)},
+        filenames={"uuid-r": "IMG_1234.jpg", "uuid-b": "IMG_0002.jpg"},
+        old_dates={"uuid-r": ref_date, "uuid-b": datetime(2025, 12, 24, 4, 0, 0)},
+    )
+    saved_build = globals()["_build_plan"]
+    try:
+        clear_env()
+        globals()["_build_plan"] = lambda verbose: fake_plan
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli_main([])  # bare run
+        text = out.getvalue()
+        assert rc == 0, rc
+        assert "usage:" not in text  # must not fall through to help
+        assert "IMG_0002.jpg" in text and "-> 2024-06-01 12:00:01" in text
+        assert "Dry run only" in text and "Writing dates" not in text
+
+        globals()["_build_plan"] = lambda verbose: (_ for _ in ()).throw(
+            ValueError("no photos selected in Photos")
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli_main([])
+        assert rc == 2, rc
+        assert "error: no photos selected" in out.getvalue()
+    finally:
+        globals()["_build_plan"] = saved_build
+        clear_env()
 
     print("selftest OK")
 
