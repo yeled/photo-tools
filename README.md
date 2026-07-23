@@ -135,3 +135,53 @@ range, `--color always|never` overrides the flag coloring (auto colors only on
 a terminal and honors `NO_COLOR`, so redirected output stays plain and
 diffable), `--library PATH` reads another library, and `--selftest` runs the
 offline tests (safe on any machine).
+
+## flatten-photos (Swift / PhotoKit)
+
+Collapse single-album "wrapper" folders in Photos.app. For a hierarchy like
+
+    import by hand > LR > 2024 > 2024-02-20 > [album]
+
+each date folder holds exactly one album; `flatten-photos` moves that album up
+into the year folder and deletes the emptied date folder:
+
+    import by hand > LR > 2024 > [album]
+
+A folder counts as a wrapper only if it contains **exactly one album and no
+subfolders** — year folders, `LR`, and anything with real structure are left
+alone. Wrapper folders are deleted only after re-verifying they are empty
+(deleting a non-empty folder in Photos would delete its contents).
+
+Why PhotoKit and not AppleScript: Photos' AppleScript dictionary has no `move`
+command and `parent` is read-only (and buggy — it errors or returns bogus
+references, error `-10008`), so the best a script can do is recreate the album
+elsewhere, copy the media references, and delete the original — losing the
+album's identity, key photo, and manual sort order. PhotoKit's
+`PHCollectionListChangeRequest.removeChildCollections`/`addChildCollections`
+does a true move: same album, nothing lost. Parent folders are never queried;
+the tool walks the tree downward and remembers where it found each wrapper.
+
+Build (needs Xcode Command Line Tools; the linker flags embed `Info.plist` so
+the bare binary can present the Photos permission prompt):
+
+```sh
+cd flatten-photos && make
+```
+
+Usage:
+
+```sh
+./flatten-photos                       # dry run, whole library
+./flatten-photos --scope LR            # dry run, only paths containing "LR"
+./flatten-photos --scope LR --apply    # actually move + delete wrappers
+./flatten-photos --apply --keep-empty  # move albums, keep the emptied folders
+```
+
+Notes:
+
+- First run pops the Photos access dialog — grant full access (or System
+  Settings > Privacy & Security > Photos afterwards).
+- `--scope` is a case-insensitive substring match against the wrapper's full
+  path, so `--scope "LR > 2024"` limits a run to one year. Do a year first,
+  eyeball it in Photos, then run the rest.
+- Dry run is the default; nothing changes without `--apply`.
