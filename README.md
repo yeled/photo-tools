@@ -90,31 +90,6 @@ osxphotos run timewarp_from_reference.py --uuid-file spike.txt --apply   # write
   with the photos selected) restores the import-time originals regardless of
   which engine wrote the dates.
 
-### Direct apply mode (PhotoKit) — no timewarp, no selection
-
-The same script can write the dates itself, through Apple's PhotoKit
-(`PHAssetChangeRequest`) — the *supported* change API, so the edits sync to
-iCloud exactly like edits made by hand in Photos, Photos.app doesn't need to
-be running, and thousands of photos take seconds instead of an AppleScript
-crawl:
-
-```sh
-osxphotos run timewarp_from_reference.py --uuid-file spike.txt           # dry run: prints the plan
-osxphotos run timewarp_from_reference.py --uuid-file spike.txt --apply   # write via PhotoKit
-```
-
-- Needs macOS ≥ 13.5 and [photokit](https://github.com/RhetTbull/photokit)
-  (alpha: `pipx inject osxphotos photokit`). The first run prompts for Photos
-  library access. System (default) library only.
-- `--ref`, `--delta`, `--order` mirror the environment variables above; dry
-  run is the default and nothing is written without `--apply`; timezones are
-  never touched.
-- `--engine applescript` writes via photoscript instead (slow, Photos must be
-  open) if you'd rather not install photokit.
-- Revert any time: `osxphotos timewarp --reset --uuid-from-file spike.txt`
-  restores the import-time originals regardless of which engine wrote the
-  dates.
-
 ## graph_photo_dates.py
 
 ASCII histogram of the dates in your Photos library, for spotting bulk
