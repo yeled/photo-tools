@@ -166,7 +166,11 @@ Apple groups that are really one photo, and czkawka-only tranches appear
 (filter by source in the review page). czkawka-only groups that are entirely
 one burst are dropped as burst siblings (`--include-bursts` keeps them).
 The first sweep perceptually hashes the whole library — hours, cached and
-incremental afterwards.
+incremental afterwards. To pace that: `--batch-size 20000` hashes in
+pausable batches (RETURN starts each batch, `a` runs the rest, `q` stops —
+every hash is cached, so rerunning the scan resumes where you left off,
+and the final grouping pass always sees the whole set so no pair is
+missed); `--threads 4` caps czkawka's CPU instead, or combine both.
 
 The plan fixes what Apple's Merge button gets wrong: the **keeper** is chosen
 by resolution → file size → format (RAW > HEIC > PNG > JPEG) → UUID, never by

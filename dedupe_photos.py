@@ -802,48 +802,82 @@ def run_exiftool(members: Dict[str, dict], out_dir: Path, verbose: Callable) -> 
     return result
 
 
+def farm_shard(uuid: str) -> str:
+    """Shard subdirectory for one asset: the first two hex chars of its
+    uuid. Stable per asset, so batch membership and czkawka's path-keyed
+    hash cache survive rescans."""
+    return _norm_uuid(uuid)[:2]
+
+
 def build_farm(members: Dict[str, dict], farm_dir: Path, verbose: Callable) -> int:
     """Hardlink every locally-present original into farm_dir as
-    <uuid>__<basename>. Rebuild is incremental; stale entries are removed.
-    Nothing inside the library is written or moved."""
+    <shard>/<uuid>__<basename>. Rebuild is incremental; stale entries
+    (including any from the old flat layout) are removed. Nothing inside
+    the library is written or moved."""
     farm_dir.mkdir(parents=True, exist_ok=True)
     wanted: Dict[str, str] = {}
     for uuid, m in sorted(members.items()):
         if m.get("path"):
-            wanted[farm_name(uuid, m["path"])] = m["path"]
-    for existing in farm_dir.iterdir():
-        if existing.name not in wanted:
+            wanted[f"{farm_shard(uuid)}/{farm_name(uuid, m['path'])}"] = m["path"]
+    for existing in farm_dir.rglob("*"):
+        if existing.is_file() and str(existing.relative_to(farm_dir)) not in wanted:
             existing.unlink()
     linked = 0
-    for name, src in wanted.items():
-        dst = farm_dir / name
-        if dst.exists():
-            linked += 1
-            continue
-        try:
-            os.link(src, dst)
-        except OSError:
-            shutil.copy2(src, dst)  # cross-device fallback; still read-only on src
+    for rel, src in wanted.items():
+        dst = farm_dir / rel
+        if not dst.exists():
+            dst.parent.mkdir(exist_ok=True)
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)  # cross-device fallback; src untouched
         linked += 1
     verbose(f"farm: {linked:,} original(s) hardlinked in {farm_dir}")
     return linked
 
 
-def run_czkawka(farm_dir: Path, out_dir: Path, near: int, verbose: Callable) -> None:
+def chunk_shards(counts: List[Tuple[object, int]], batch_size: int
+                 ) -> List[List[Tuple[object, int]]]:
+    """Group (shard, file_count) pairs into batches of >= batch_size files
+    (last batch takes the remainder)."""
+    batches: List[List[Tuple[object, int]]] = []
+    cur: List[Tuple[object, int]] = []
+    cur_n = 0
+    for item in counts:
+        cur.append(item)
+        cur_n += item[1]
+        if cur_n >= batch_size:
+            batches.append(cur)
+            cur, cur_n = [], 0
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def run_czkawka(farm_dir: Path, out_dir: Path, near: int, verbose: Callable,
+                threads: int = 0, tools: Sequence[str] = ("dup", "image", "video"),
+                dirs: Optional[Sequence[Path]] = None,
+                json_prefix: str = "czkawka") -> None:
+    """Run the selected czkawka tools over dirs (default: the whole farm).
+    czkawka caches every hash it computes (keyed by path), so partial runs
+    -- the batched warm-up passes -- make the final full pass cheap."""
     czkawka = shutil.which("czkawka_cli")
     if not czkawka:
         raise SystemExit("czkawka_cli not found on PATH (brew install czkawka)")
-    runs = [
-        ("dup", out_dir / "czkawka_dup.json",
-         [czkawka, "dup", "-d", str(farm_dir), "-m", "1024", "-s", "HASH"]),
-        ("image", out_dir / "czkawka_image.json",
-         [czkawka, "image", "-d", str(farm_dir), "-m", "1024", "-s", str(near)]),
-        ("video", out_dir / "czkawka_video.json",
-         [czkawka, "video", "-d", str(farm_dir), "-m", "1024"]),
-    ]
-    for label, json_path, cmd in runs:
-        verbose(f"czkawka {label}: scanning farm...")
-        proc = subprocess.run(cmd + ["-p", str(json_path), "-N", "-M", "-W"],
+    dir_args: List[str] = []
+    for d in (dirs or [farm_dir]):
+        dir_args += ["-d", str(d)]
+    thread_args = ["-T", str(threads)] if threads > 0 else []
+    runs = {
+        "dup": [czkawka, "dup", *dir_args, "-m", "1024", "-s", "HASH"],
+        "image": [czkawka, "image", *dir_args, "-m", "1024", "-s", str(near)],
+        "video": [czkawka, "video", *dir_args, "-m", "1024"],
+    }
+    for label in tools:
+        json_path = out_dir / f"{json_prefix}_{label}.json"
+        verbose(f"czkawka {label}: scanning...")
+        proc = subprocess.run(runs[label] + thread_args
+                              + ["-p", str(json_path), "-N", "-M", "-W"],
                               capture_output=True, text=True)
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip()[-400:]
@@ -852,7 +886,7 @@ def run_czkawka(farm_dir: Path, out_dir: Path, near: int, verbose: Callable) -> 
             json_path.write_text("[]")
         else:
             groups = czkawka_uuid_groups(json.loads(json_path.read_text() or "[]"))
-            verbose(f"  czkawka {label}: {len(groups):,} group(s) among farm files")
+            verbose(f"  czkawka {label}: {len(groups):,} group(s)")
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
@@ -905,7 +939,42 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 f"to sweep ({len(members) - total_local:,} assets have no "
                 "local original and are invisible to discovery)")
         build_farm({u: members[u] for u in farm_uuids}, farm_dir, verbose)
-        run_czkawka(farm_dir, out_dir, args.near, verbose)
+
+        # batched, pausable hashing: warm czkawka's hash cache shard-group
+        # by shard-group, waiting for RETURN between batches, then let the
+        # final full pass below group everything from the cache
+        if args.batch_size > 0:
+            if not sys.stdin.isatty():
+                verbose("--batch-size needs an interactive terminal; running "
+                        "the sweep in one pass instead")
+            else:
+                shard_dirs = sorted(d for d in farm_dir.iterdir() if d.is_dir())
+                counts = [(d, sum(1 for f in d.iterdir() if f.is_file()))
+                          for d in shard_dirs]
+                batches = chunk_shards(counts, args.batch_size)
+                verbose(f"batched hashing: {len(batches)} batch(es); every "
+                        "hash is cached, so quitting and rerunning later "
+                        "resumes where you left off")
+                pause = True
+                for i, batch in enumerate(batches, start=1):
+                    n = sum(c for _, c in batch)
+                    if pause:
+                        answer = input(
+                            f"Batch {i}/{len(batches)} (~{n:,} files) -- "
+                            "RETURN to run, a=run all remaining, "
+                            "q=quit (resume later): ").strip().lower()
+                        if answer == "q":
+                            verbose("stopped; rerun scan --discover to resume "
+                                    "(already-hashed batches are nearly free)")
+                            return 0
+                        if answer == "a":
+                            pause = False
+                    run_czkawka(farm_dir, out_dir, args.near, verbose,
+                                threads=args.threads, tools=("image", "video"),
+                                dirs=[d for d, _ in batch],
+                                json_prefix="czkawka_warm")
+
+        run_czkawka(farm_dir, out_dir, args.near, verbose, threads=args.threads)
         cz_group_sets = czkawka_group_sets(out_dir)
         verbose(f"czkawka: {len(cz_group_sets):,} group(s) across the sweep")
 
@@ -942,7 +1011,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     if not args.discover and not args.skip_czkawka:
         build_farm({u: scan_members[u] for u in scan_members
                     if scan_members[u].get("path")}, farm_dir, verbose)
-        run_czkawka(farm_dir, out_dir, args.near, verbose)
+        run_czkawka(farm_dir, out_dir, args.near, verbose, threads=args.threads)
 
     local = sum(1 for m in scan_members.values() if m.get("path"))
     scan = {
@@ -2215,6 +2284,13 @@ def add_scan_args(p: argparse.ArgumentParser) -> None:
                    help="only the first N groups (smoke tests)")
     p.add_argument("--near", type=int, default=DEFAULT_NEAR,
                    help=f"czkawka image max distance (default {DEFAULT_NEAR})")
+    p.add_argument("--batch-size", type=int, default=0, metavar="N",
+                   help="discovery only: hash in pausable batches of ~N files "
+                   "(RETURN between batches, q to stop and resume later; "
+                   "e.g. 20000). The final grouping pass reuses every "
+                   "cached hash.")
+    p.add_argument("--threads", type=int, default=0, metavar="N",
+                   help="limit czkawka to N CPU threads (default: all cores)")
     p.add_argument("--skip-czkawka", action="store_true",
                    help="skip the czkawka verification runs")
     p.add_argument("--skip-exif", action="store_true",
@@ -2483,9 +2559,20 @@ def selftest() -> None:
     assert {"U1", "U2", "U3"} in kept_sets    # apple-sourced, kept regardless
     assert drop_burst_only_tranches([], {}) == ([], 0)
 
-    # farm names round-trip
+    # farm names round-trip; sharding is stable and uuid-derived
     assert farm_uuid(farm_name("ABC-123", "/x/y/IMG__weird__name.HEIC")) == "ABC-123"
     assert farm_uuid("abc-1__file.jpg") == "ABC-1"
+    assert farm_shard("0fba8544-8aac-4b24-8d75-a4956e5efe9c") == "0F"
+    assert farm_shard("ABC-1") == "AB"
+
+    # shard chunking: batches reach the target size, remainder survives
+    counts = [("a", 400), ("b", 400), ("c", 400), ("d", 400), ("e", 100)]
+    batches = chunk_shards(counts, 700)
+    assert [[s for s, _ in b] for b in batches] == [["a", "b"], ["c", "d"], ["e"]]
+    assert chunk_shards([], 1000) == []
+    assert chunk_shards([("a", 10)], 1000) == [[("a", 10)]]
+    one_each = chunk_shards([("a", 500), ("b", 600)], 100)
+    assert [[s for s, _ in b] for b in one_each] == [["a"], ["b"]]
 
     # czkawka JSON normalization: image (list) and dup (dict) shapes
     img_json = [[{"path": "/f/U1__a.jpg", "difference": 0},
