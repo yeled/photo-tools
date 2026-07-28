@@ -161,6 +161,49 @@ a terminal and honors `NO_COLOR`, so redirected output stays plain and
 diffable), `--library PATH` reads another library, and `--selftest` runs the
 offline tests (safe on any machine).
 
+## dedupe_photos.py
+
+Deterministic duplicate merging for Photos, phase 1: **read-only** scan +
+plan + review. Apple's own Duplicates analysis is harvested straight from the
+library database — `ZASSET.ZDUPLICATEPERCEPTUALMATCHINGALBUM` /
+`ZDUPLICATEMETADATAMATCHINGALBUM` carry the grouping the Duplicates album
+shows, so nothing needs to be selected or exported — then every group is
+cross-checked with czkawka (`brew install czkawka`; the Homebrew build decodes
+HEIC) by hardlinking the originals into a scratch farm and running its exact
+(BLAKE3), perceptual-image, and video-signature tools over it.
+
+```sh
+osxphotos run dedupe_photos.py all --open       # scan + plan + review report
+osxphotos run dedupe_photos.py scan --limit 5   # smoke test on 5 groups
+python3 dedupe_photos.py --selftest             # offline tests, safe anywhere
+```
+
+The plan fixes what Apple's Merge button gets wrong: the **keeper** is chosen
+by resolution → file size → format (RAW > HEIC > PNG > JPEG) → UUID, never by
+date, and the **merged date** is the oldest *plausible* timestamp found
+anywhere in the tranche (every member's Photos date plus its file's
+EXIF/QuickTime dates via exiftool; epoch placeholders, pre-1990 and future
+dates are excluded but shown). Same inputs, same answer, every time.
+
+`review` renders a static HTML gallery: members side by side with thumbnails,
+every date candidate (implausible ones struck through), czkawka verification
+tier per tranche (`exact` / `visual-0` / `near` / `video` / `partial` /
+`unverified` — the last two are Apple-only claims czkawka could not confirm,
+so look closely). Approve/reject per tranche or in bulk, pick a different
+keeper, then *Export decisions* — the downloaded `decisions.json` plus
+`plan.json` are the inputs to the future apply stage (PhotoKit date writes +
+one batched delete; not built yet). Nothing in the library is modified by any
+of this.
+
+**WAL caveat:** the default scan reader loads the library via osxphotos,
+which copies `Photos.sqlite` *and its write-ahead log* to a temp dir. After a
+huge import the WAL can be enormous (143 GB here), so scan refuses that
+reader above `--max-wal-gb` (default 2). Quit Photos and everything else
+holding the database (Messages, widgets — reopening Photos once, or a reboot,
+lets macOS checkpoint), or use `--reader sqlite`, which reads the live
+database in place at any WAL size and works mid-import, at the cost of
+albums/keywords and derivative-based (fast) thumbnails.
+
 ## flatten-photos (Swift / PhotoKit)
 
 Collapse single-album "wrapper" folders in Photos.app. For a hierarchy like

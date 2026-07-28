@@ -1,0 +1,1653 @@
+"""Merge Apple Photos duplicates deterministically, starting from Apple's own
+Duplicates analysis, verified by czkawka.
+
+Phase 1 (this tool, READ-ONLY): harvest Apple's duplicate groups straight from
+the Photos library database (the same groups the Duplicates album shows --
+`ZASSET.ZDUPLICATEPERCEPTUALMATCHINGALBUM` / `ZDUPLICATEMETADATAMATCHINGALBUM`
+carry the grouping itself, so nothing needs to be selected or exported),
+cross-check every group with czkawka's exact (BLAKE3) and perceptual hashes,
+compute a deterministic merge plan, and render an HTML review gallery. Nothing
+in the library is modified; the plan is the input to a later apply stage.
+
+The merge plan fixes what Apple's own Merge button gets wrong:
+
+  * KEEPER (which pixels survive) is chosen by resolution, then file size,
+    then format (RAW > HEIC > PNG/TIFF > JPEG), then UUID -- never by date.
+  * MERGED DATE is the OLDEST plausible timestamp found anywhere in the
+    tranche: every member's Photos date plus its file's EXIF/QuickTime dates
+    (DateTimeOriginal, CreateDate, CreationDate via exiftool). Implausible
+    dates (epoch markers, before --min-plausible-year, in the future) are
+    excluded but shown. Deterministic: same inputs, same answer, always.
+
+Pipeline (each stage writes JSON the next one reads; rerun any stage):
+
+    osxphotos run dedupe_photos.py scan     # library -> scan.json + czkawka runs
+    osxphotos run dedupe_photos.py plan     # scan.json -> plan.json (pure, offline)
+    osxphotos run dedupe_photos.py review   # plan.json -> report/index.html
+    osxphotos run dedupe_photos.py all      # the three in sequence
+
+scan readers (--reader):
+    osxphotos  (default) rich metadata: albums, keywords, Live/RAW/burst
+               pairing, derivative thumbnails. Loads the library via the
+               osxphotos package, which COPIES Photos.sqlite AND its WAL to
+               a temp dir -- so scan refuses to run this reader while the WAL
+               is huge (see --max-wal-gb). Quit Photos and let it checkpoint
+               first (reopen Photos once, or reboot), then rerun.
+    sqlite     reads the live database directly (WAL honored, nothing copied,
+               safe at any WAL size, works mid-import). Fewer fields: no
+               albums/keywords, flags limited to hidden/trash/video/live.
+
+czkawka verification (needs `czkawka_cli` on PATH; Homebrew build decodes
+HEIC): originals are HARDLINKED into <out>/farm/ (no data copied) and czkawka
+runs its `dup` (byte-identical), `image` (perceptual distance) and `video`
+tools over the farm. Each tranche is annotated with a verification tier:
+
+    exact       every member byte-identical (dup)
+    visual-0    perceptual distance 0 and identical dimensions
+    near        all members matched within --near distance
+    video       video-signature match
+    partial     czkawka matched some but not all members
+    unverified  czkawka found no relation (Apple-only claim) -- review these!
+
+The review page (static HTML, no server, no dependencies) shows each tranche
+side by side: thumbnails, metadata, every date candidate (implausible ones
+struck through), the proposed keeper (switchable) and merged date. Approve /
+reject per tranche, bulk-approve by tier, then Export writes decisions.json
+for the future apply stage. Decisions persist in browser localStorage keyed
+by plan fingerprint.
+
+Everything is read-only toward the Photos library: the database is opened
+read-only, farm entries are hardlinks, czkawka never deletes (its delete
+method is never enabled), thumbnails are written under --out only.
+
+Options (see each subcommand's --help):
+    --out DIR                working directory (default: dedupe-out)
+    --library PATH           Photos library (default: last-opened / ~/Pictures)
+    --limit N                scan only the first N Apple groups (smoke tests)
+    --skip-czkawka/--skip-exif  skip those scan steps
+    --near N                 czkawka image max distance (default 10)
+    --max-wal-gb F           refuse osxphotos reader above this WAL size (2.0)
+    --min-plausible-year Y   older dates are implausible (default 1990)
+    --date-spread-warn-days D  warn when candidates span more (default 2)
+    --selftest               offline self-tests, safe anywhere, no library
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import html
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import urllib.parse
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+SCRIPT = "dedupe_photos.py"
+PLAN_VERSION = 1
+
+DEFAULT_OUT = "dedupe-out"
+DEFAULT_NEAR = 10
+DEFAULT_MAX_WAL_GB = 2.0
+DEFAULT_MIN_PLAUSIBLE_YEAR = 1990
+DEFAULT_SPREAD_WARN_DAYS = 2.0
+DEFAULT_THUMB_PX = 384
+
+ISO_FMT = "%Y-%m-%dT%H:%M:%S"
+
+RAW_EXTS = {"dng", "cr2", "cr3", "crw", "nef", "nrw", "arw", "orf", "raf",
+            "rw2", "pef", "srw", "x3f", "3fr", "erf", "kdc", "mrw", "raw"}
+VIDEO_EXTS = {"mov", "mp4", "m4v", "avi", "mpg", "mpeg", "3gp", "mkv", "webm",
+              "mts", "m2ts", "wmv", "flv"}
+
+# keeper tiebreak only (after pixels and bytes): smaller rank wins
+_FORMAT_RANKS = [(RAW_EXTS, 0), ({"heic", "heif"}, 1), ({"png", "tiff", "tif"}, 2),
+                 ({"jpg", "jpeg", "gif", "bmp", "webp"}, 3), (VIDEO_EXTS, 4)]
+
+# timestamps that are camera/importer placeholders, never real capture times
+EPOCH_MARKERS = {
+    datetime(1904, 1, 1, 0, 0, 0),
+    datetime(1970, 1, 1, 0, 0, 0),
+    datetime(1980, 1, 1, 0, 0, 0),
+    datetime(2001, 1, 1, 0, 0, 0),
+}
+
+VISIBILITY_FLAGS = ("shared-with-you", "hidden", "shared-album", "trash")
+TIER_ORDER = ["exact", "visual-0", "near", "video", "partial", "unverified"]
+
+CORE_DATA_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
+
+
+# --------------------------------------------------------------------------
+# small pure helpers (covered by --selftest)
+# --------------------------------------------------------------------------
+
+def _norm_uuid(raw: str) -> str:
+    """AppleScript ids look like "UUID/L0/001"; reduce to the plain UUID."""
+    return raw.split("/")[0].upper()
+
+
+def iso(dt: Optional[datetime]) -> Optional[str]:
+    return dt.strftime(ISO_FMT) if dt else None
+
+
+def parse_iso(text: Optional[str]) -> Optional[datetime]:
+    return datetime.strptime(text, ISO_FMT) if text else None
+
+
+def core_data_to_local(value) -> Optional[datetime]:
+    """Core Data timestamp (seconds since 2001-01-01 UTC) -> naive local
+    datetime (the convention the rest of this repo speaks). 0/None -> None
+    (0 is Photos' own missing-date placeholder)."""
+    if value is None or value == 0:
+        return None
+    try:
+        dt = CORE_DATA_EPOCH + timedelta(seconds=float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return dt.astimezone().replace(tzinfo=None)
+
+
+def parse_exif_dt(text) -> Optional[datetime]:
+    """Parse exiftool output into naive local time. Handles our -d format
+    ("2016-08-19T09:12:44"), trailing UTC offsets ("+02:00" / "+0200" / "Z"),
+    exiftool's native "2016:08:19 09:12:44", and rejects placeholders."""
+    if not text or not isinstance(text, str):
+        return None
+    text = text.strip()
+    if not text or text.startswith(("-", "0000")):
+        return None
+    native = re.match(r"^(\d{4}):(\d{2}):(\d{2}) ", text)
+    if native:
+        text = f"{native.group(1)}-{native.group(2)}-{native.group(3)}T{text[11:]}"
+    text = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", text)  # +0200 -> +02:00
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+def is_suspect_date(dt: datetime, min_year: int, now: datetime) -> bool:
+    """Placeholder epochs, too-old, and future dates are implausible as the
+    real capture time; they are excluded from the merged-date minimum (but
+    still recorded and shown in review)."""
+    if dt in EPOCH_MARKERS:
+        return True
+    if dt.year < min_year:
+        return True
+    if dt > now + timedelta(days=1):
+        return True
+    return False
+
+
+def format_rank(ext: str) -> int:
+    ext = ext.lower().lstrip(".")
+    for exts, rank in _FORMAT_RANKS:
+        if ext in exts:
+            return rank
+    return 5
+
+
+def hsize(n: Optional[int]) -> str:
+    if not n:
+        return "?"
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:,.0f} {unit}" if unit == "B" else f"{size:,.1f} {unit}"
+        size /= 1024
+    return f"{n}"
+
+
+def choose_keeper(members: List[dict]) -> str:
+    """Best pixels win: resolution desc, bytes desc, format rank asc, then
+    UUID asc so the choice is stable. Dates play no part."""
+    def key(m: dict):
+        return (
+            -((m.get("width") or 0) * (m.get("height") or 0)),
+            -(m.get("size") or 0),
+            format_rank(m.get("ext") or ""),
+            m["uuid"],
+        )
+    return min(members, key=key)["uuid"]
+
+
+def date_candidates(member: dict) -> List[Tuple[str, datetime]]:
+    """(label, naive local datetime) for every timestamp this member offers,
+    deterministic order."""
+    out: List[Tuple[str, datetime]] = []
+    photos = parse_iso(member.get("photos_date"))
+    if photos:
+        out.append(("photos", photos))
+    exif = member.get("exif") or {}
+    for label, key in (("exif-dto", "DateTimeOriginal"),
+                       ("exif-create", "CreateDate"),
+                       ("exif-creation", "CreationDate")):
+        dt = parse_exif_dt(exif.get(key))
+        if dt:
+            out.append((label, dt))
+    return out
+
+
+def merged_date(members: List[dict], min_year: int, now: datetime,
+                spread_warn_days: float) -> Tuple[Optional[str], Optional[str], float, List[str]]:
+    """The oldest plausible timestamp across the whole tranche.
+
+    Returns (iso date, source label, spread in days over the plausible pool,
+    warnings). If every candidate is implausible, falls back to the oldest
+    Photos date and says so."""
+    pool: List[Tuple[str, str, datetime]] = []  # (label, filename, dt)
+    all_cands: List[Tuple[str, str, datetime]] = []
+    for m in members:
+        for label, dt in date_candidates(m):
+            all_cands.append((label, m.get("filename") or m["uuid"], dt))
+            if not is_suspect_date(dt, min_year, now):
+                pool.append((label, m.get("filename") or m["uuid"], dt))
+
+    warnings: List[str] = []
+    if not all_cands:
+        return None, None, 0.0, ["no-dates"]
+    if not pool:
+        warnings.append("all-dates-suspect")
+        photos_only = [c for c in all_cands if c[0] == "photos"] or all_cands
+        pool = photos_only
+
+    label, fname, dt = min(pool, key=lambda c: (c[2], c[0], c[1]))
+    spread = round((max(c[2] for c in pool) - min(c[2] for c in pool)).total_seconds() / 86400, 1)
+    if spread > spread_warn_days:
+        warnings.append(f"date-spread-{spread}d")
+    return iso(dt), f"{label}:{fname}", spread, warnings
+
+
+class UnionFind:
+    def __init__(self) -> None:
+        self.parent: Dict[str, str] = {}
+
+    def find(self, x: str) -> str:
+        self.parent.setdefault(x, x)
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a: str, b: str) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            if rb < ra:  # deterministic root choice
+                ra, rb = rb, ra
+            self.parent[rb] = ra
+
+
+def build_apple_tranches(rows: List[Tuple[str, Optional[int], Optional[int]]]
+                         ) -> List[dict]:
+    """rows = (uuid, perceptual_group_id, metadata_group_id). Assets sharing
+    either group id merge into one tranche; an asset in both a perceptual and
+    a metadata group bridges them. Group-id namespaces are kept apart with a
+    prefix. Singletons (their partners are all in the trash, etc.) drop out."""
+    uf = UnionFind()
+    group_members: Dict[str, List[str]] = {}
+    for uuid, pgrp, mgrp in rows:
+        for prefix, grp in (("P", pgrp), ("M", mgrp)):
+            if grp is not None:
+                group_members.setdefault(f"{prefix}{grp}", []).append(uuid)
+    for gid, uuids in group_members.items():
+        for other in uuids[1:]:
+            uf.union(uuids[0], other)
+
+    clusters: Dict[str, Set[str]] = {}
+    uuid_groups: Dict[str, Set[str]] = {}
+    for gid, uuids in group_members.items():
+        for u in uuids:
+            clusters.setdefault(uf.find(u), set()).add(u)
+            uuid_groups.setdefault(u, set()).add(gid)
+
+    tranches = []
+    for root in sorted(clusters):
+        members = sorted(clusters[root])
+        if len(members) < 2:
+            continue
+        gids = sorted(set().union(*(uuid_groups[u] for u in members)))
+        sources = sorted({"apple-perceptual" if g[0] == "P" else "apple-metadata"
+                          for g in gids})
+        tranches.append({
+            "key": tranche_key(members),
+            "members": members,
+            "apple_groups": gids,
+            "sources": sources,
+        })
+    tranches.sort(key=lambda t: t["key"])
+    return tranches
+
+
+def tranche_key(uuids: Iterable[str]) -> str:
+    """Stable id for a set of assets, independent of discovery order."""
+    joined = "\n".join(sorted(u.upper() for u in uuids))
+    return hashlib.sha1(joined.encode()).hexdigest()[:12]
+
+
+def farm_name(uuid: str, path: str) -> str:
+    return f"{uuid}__{os.path.basename(path)}"
+
+
+def farm_uuid(name: str) -> str:
+    return _norm_uuid(os.path.basename(name).split("__", 1)[0])
+
+
+def iter_czkawka_groups(data) -> List[List[dict]]:
+    """Normalize czkawka JSON: `image`/`video` emit a list of groups;
+    `dup` emits {size: [group, ...]}. A group is a list of entries with a
+    "path" key."""
+    groups: List[List[dict]] = []
+    if isinstance(data, dict):
+        for value in data.values():
+            groups.extend(iter_czkawka_groups(value))
+        return groups
+    if isinstance(data, list):
+        if data and isinstance(data[0], dict) and "path" in data[0]:
+            return [data]
+        for item in data:
+            groups.extend(iter_czkawka_groups(item))
+    return groups
+
+
+def czkawka_uuid_groups(data) -> List[Dict[str, dict]]:
+    """czkawka JSON -> list of {uuid: entry} per group (farm filenames carry
+    the uuid). Entries whose name does not look like a farm entry are
+    dropped."""
+    out = []
+    for group in iter_czkawka_groups(data):
+        m: Dict[str, dict] = {}
+        for entry in group:
+            name = os.path.basename(entry.get("path", ""))
+            if "__" in name:
+                m[farm_uuid(name)] = entry
+        if len(m) >= 2:
+            out.append(m)
+    return out
+
+
+def tranche_tier(member_uuids: List[str], members: Dict[str, dict],
+                 dup_groups: List[Dict[str, dict]],
+                 image_groups: List[Dict[str, dict]],
+                 video_groups: List[Dict[str, dict]]) -> Tuple[str, Optional[int]]:
+    """Verification tier for one tranche (see module docstring), plus the
+    max perceptual distance seen between members (None when not applicable)."""
+    mset = set(member_uuids)
+
+    for g in dup_groups:
+        if mset <= set(g):
+            return "exact", None
+
+    covered: Set[str] = set()
+    max_diff: Optional[int] = None
+    dims_equal = True
+    for g in image_groups:
+        overlap = mset & set(g)
+        if len(overlap) >= 2:
+            covered |= overlap
+            for u in overlap:
+                d = g[u].get("difference")
+                if isinstance(d, int):
+                    max_diff = d if max_diff is None else max(max_diff, d)
+    for g in video_groups:
+        overlap = mset & set(g)
+        if len(overlap) >= 2:
+            covered |= overlap
+    # byte-identical subsets still count as covered members
+    for g in dup_groups:
+        overlap = mset & set(g)
+        if len(overlap) >= 2:
+            covered |= overlap
+
+    if covered >= mset:
+        dims = {(members[u].get("width"), members[u].get("height")) for u in mset}
+        dims_equal = len(dims) == 1
+        if max_diff == 0 and dims_equal:
+            return "visual-0", 0
+        if max_diff is not None:
+            return "near", max_diff
+        return "video", None
+    if covered:
+        return "partial", max_diff
+    return "unverified", None
+
+
+def wal_refusal(wal_bytes: int, max_gb: float) -> Optional[str]:
+    """Reason to refuse the osxphotos reader, or None when safe. osxphotos
+    copies Photos.sqlite AND the -wal to a temp dir on load; with a runaway
+    WAL that is a huge, slow copy."""
+    limit = int(max_gb * 1024**3)
+    if wal_bytes <= limit:
+        return None
+    return (
+        f"Photos.sqlite-wal is {wal_bytes / 1024**3:.1f} GB (limit {max_gb:g} GB). "
+        "The osxphotos reader would copy all of it to a temp dir. Quit Photos "
+        "(and Messages, which also holds the database open) so macOS can "
+        "checkpoint -- reopening Photos once after quitting everything, or a "
+        "reboot, does it -- then rerun. Or rerun with --reader sqlite (fewer "
+        "fields, but reads the live database without copying), or raise "
+        "--max-wal-gb if you really want the copy."
+    )
+
+
+def member_public(m: dict) -> dict:
+    """Member as stored in scan.json / shown to review (drop absolute paths
+    from the report data; keep them in scan.json for later stages)."""
+    return m
+
+
+def suggest_approve(tier: str, warnings: List[str]) -> bool:
+    return tier in ("exact", "visual-0") and not warnings
+
+
+# --------------------------------------------------------------------------
+# scan: Photos.sqlite groups + member metadata + exiftool + czkawka
+# --------------------------------------------------------------------------
+
+def default_library_path() -> Path:
+    try:
+        from osxphotos.utils import get_last_library_path
+        p = get_last_library_path()
+        if p:
+            return Path(p)
+    except Exception:
+        pass
+    return Path.home() / "Pictures" / "Photos Library.photoslibrary"
+
+
+def sqlite_ro(db_path: Path) -> sqlite3.Connection:
+    uri = f"file:{urllib.parse.quote(str(db_path))}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
+    try:
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.DatabaseError:
+        return set()
+
+
+def read_apple_groups(conn: sqlite3.Connection
+                      ) -> List[Tuple[str, Optional[int], Optional[int]]]:
+    cols = table_columns(conn, "ZASSET")
+    need = {"ZUUID", "ZTRASHEDSTATE",
+            "ZDUPLICATEPERCEPTUALMATCHINGALBUM", "ZDUPLICATEMETADATAMATCHINGALBUM"}
+    missing = need - cols
+    if missing:
+        raise SystemExit(
+            f"Photos.sqlite schema is missing {sorted(missing)} -- this macOS "
+            "version stores duplicate groups differently; scan cannot proceed."
+        )
+    rows = conn.execute(
+        "SELECT ZUUID, ZDUPLICATEPERCEPTUALMATCHINGALBUM AS P,"
+        " ZDUPLICATEMETADATAMATCHINGALBUM AS M"
+        " FROM ZASSET WHERE ZTRASHEDSTATE = 0"
+        " AND (ZDUPLICATEPERCEPTUALMATCHINGALBUM IS NOT NULL"
+        "  OR ZDUPLICATEMETADATAMATCHINGALBUM IS NOT NULL)"
+        " ORDER BY Z_PK"
+    ).fetchall()
+    return [(_norm_uuid(r["ZUUID"]), r["P"], r["M"]) for r in rows]
+
+
+def library_generation(conn: sqlite3.Connection, wal_bytes: int) -> dict:
+    row = conn.execute("SELECT COUNT(*) AS n, MAX(Z_PK) AS mx FROM ZASSET").fetchone()
+    return {"asset_count": row["n"], "max_pk": row["mx"], "wal_bytes": wal_bytes}
+
+
+def read_members_sqlite(conn: sqlite3.Connection, library: Path,
+                        uuids: Set[str], verbose: Callable) -> Dict[str, dict]:
+    """Member metadata straight from ZASSET (live WAL read, nothing copied).
+    Optional columns are guarded so schema drift degrades instead of breaking."""
+    cols = table_columns(conn, "ZASSET")
+    aaa_cols = table_columns(conn, "ZADDITIONALASSETATTRIBUTES")
+
+    def sel(name: str, alias: str) -> str:
+        return f"a.{name} AS {alias}" if name in cols else f"NULL AS {alias}"
+
+    parts = [
+        "a.ZUUID AS uuid", sel("ZDIRECTORY", "dir"), sel("ZFILENAME", "fname"),
+        sel("ZDATECREATED", "created"), sel("ZADDEDDATE", "added"),
+        sel("ZWIDTH", "width"), sel("ZHEIGHT", "height"),
+        sel("ZFAVORITE", "favorite"), sel("ZHIDDEN", "hidden"),
+        sel("ZTRASHEDSTATE", "trashed"), sel("ZKIND", "kind"),
+        sel("ZKINDSUBTYPE", "kindsubtype"), sel("ZAVALANCHEUUID", "burst_key"),
+    ]
+    join = ""
+    if "ZORIGINALFILENAME" in aaa_cols and "ZASSET" in aaa_cols:
+        parts.append("aaa.ZORIGINALFILENAME AS original_filename")
+        join = "LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK"
+    else:
+        parts.append("NULL AS original_filename")
+
+    members: Dict[str, dict] = {}
+    rows = conn.execute(f"SELECT {', '.join(parts)} FROM ZASSET a {join}").fetchall()
+    for r in rows:
+        uuid = _norm_uuid(r["uuid"])
+        if uuid not in uuids:
+            continue
+        # ZDIRECTORY is the shard char ("5") for plain assets, but a full
+        # library-relative path ("scopes/syndication/...") for shared ones
+        path = None
+        if r["dir"] is not None and r["fname"]:
+            for candidate in (library / "originals" / str(r["dir"]) / r["fname"],
+                              library / str(r["dir"]) / r["fname"]):
+                if candidate.exists():
+                    path = str(candidate)
+                    break
+        ext = os.path.splitext(r["fname"] or "")[1].lstrip(".").lower()
+        flags = []
+        if r["hidden"]:
+            flags.append("hidden")
+        if r["trashed"]:
+            flags.append("trash")
+        if r["kind"] == 1 or ext in VIDEO_EXTS:
+            flags.append("video")
+        if r["kindsubtype"] == 2:
+            flags.append("live")
+        if path is None:
+            flags.append("missing")
+        members[uuid] = {
+            "uuid": uuid,
+            "filename": r["original_filename"] or r["fname"] or uuid,
+            "ext": ext,
+            "path": path,
+            "thumb_source": path,
+            "size": os.path.getsize(path) if path else None,
+            "width": r["width"],
+            "height": r["height"],
+            "photos_date": iso(core_data_to_local(r["created"])),
+            "date_added": iso(core_data_to_local(r["added"])),
+            "favorite": bool(r["favorite"]),
+            "flags": flags,
+            "burst_key": r["burst_key"],
+            "albums": [],
+            "keywords": [],
+            "title": None,
+            "description": None,
+            "reader": "sqlite",
+        }
+    found = set(members)
+    for uuid in sorted(uuids - found):
+        verbose(f"  warning: {uuid} in a duplicate group but not readable; skipping")
+    return members
+
+
+def read_members_osxphotos(library: Optional[Path], uuids: Set[str],
+                           verbose: Callable) -> Tuple[Dict[str, dict], Path]:
+    """Rich member metadata via the osxphotos package (albums, keywords,
+    Live/RAW/burst pairing, derivative previews for thumbnails)."""
+    import osxphotos
+
+    verbose("loading the Photos library via osxphotos (may take a while)...")
+    db = osxphotos.PhotosDB(dbfile=str(library)) if library else osxphotos.PhotosDB()
+    lib_path = Path(db.library_path)
+    verbose(f"loaded {lib_path}")
+
+    members: Dict[str, dict] = {}
+    for uuid in sorted(uuids):
+        p = db.get_photo(uuid)
+        if p is None:
+            verbose(f"  warning: {uuid} in a duplicate group but not in the "
+                    "osxphotos view of the library; skipping")
+            continue
+        d = p.date
+        if d is not None and d.tzinfo is not None:
+            d = d.astimezone().replace(tzinfo=None)
+        added = p.date_added
+        if added is not None and added.tzinfo is not None:
+            added = added.astimezone().replace(tzinfo=None)
+        path = p.path
+        ext = os.path.splitext(p.original_filename or p.filename or "")[1].lstrip(".").lower()
+        if not ext and path:
+            ext = os.path.splitext(path)[1].lstrip(".").lower()
+        flags = []
+        if getattr(p, "syndicated", None) and not getattr(p, "saved_to_library", True):
+            flags.append("shared-with-you")
+        if p.hidden:
+            flags.append("hidden")
+        if getattr(p, "shared", False):
+            flags.append("shared-album")
+        if getattr(p, "intrash", False):
+            flags.append("trash")
+        if getattr(p, "ismissing", False) or not path:
+            flags.append("missing")
+        if getattr(p, "ismovie", False) or ext in VIDEO_EXTS:
+            flags.append("video")
+        if getattr(p, "live_photo", False):
+            flags.append("live")
+        if getattr(p, "has_raw", False):
+            flags.append("raw")
+        if getattr(p, "burst", False):
+            flags.append("burst")
+        derivatives = [d for d in (getattr(p, "path_derivatives", None) or [])
+                       if str(d).lower().endswith((".jpg", ".jpeg"))]
+        size = None
+        if path and os.path.exists(path):
+            size = os.path.getsize(path)
+        else:
+            size = getattr(p, "original_filesize", None)
+        members[_norm_uuid(uuid)] = {
+            "uuid": _norm_uuid(uuid),
+            "filename": p.original_filename or p.filename or uuid,
+            "ext": ext,
+            "path": path,
+            "thumb_source": (derivatives[0] if derivatives else path),
+            "size": size,
+            "width": p.width,
+            "height": p.height,
+            "photos_date": iso(d),
+            "date_added": iso(added),
+            "favorite": bool(p.favorite),
+            "flags": flags,
+            "burst_key": getattr(p, "burst_key", None),
+            "albums": sorted(set(p.albums or [])),
+            "keywords": sorted(set(p.keywords or [])),
+            "title": p.title,
+            "description": p.description,
+            "reader": "osxphotos",
+        }
+    return members, lib_path
+
+
+def run_exiftool(members: Dict[str, dict], out_dir: Path, verbose: Callable) -> dict:
+    """One batched exiftool run over every locally-present original.
+    QuickTimeUTC=1 renders QuickTime dates in local time like everything else."""
+    exiftool = shutil.which("exiftool")
+    if not exiftool:
+        verbose("exiftool not found on PATH; skipping EXIF date candidates")
+        return {}
+    paths = {m["path"]: u for u, m in members.items() if m.get("path")}
+    if not paths:
+        return {}
+    listfile = out_dir / "exiftool_files.txt"
+    listfile.write_text("\n".join(sorted(paths)) + "\n")
+    verbose(f"exiftool: reading dates from {len(paths):,} original(s)...")
+    proc = subprocess.run(
+        [exiftool, "-j", "-f", "-fast2", "-api", "QuickTimeUTC=1",
+         "-d", "%Y-%m-%dT%H:%M:%S",
+         "-DateTimeOriginal", "-CreateDate", "-CreationDate",
+         "-@", str(listfile)],
+        capture_output=True, text=True)
+    if proc.returncode not in (0, 1) or not proc.stdout.strip():
+        # exit 1 just means some files had no tags; anything else is real
+        verbose(f"exiftool failed (exit {proc.returncode}): {proc.stderr.strip()[:300]}")
+        return {}
+    result = {}
+    for rec in json.loads(proc.stdout):
+        uuid = paths.get(rec.get("SourceFile"))
+        if uuid:
+            result[uuid] = {k: rec.get(k) for k in
+                            ("DateTimeOriginal", "CreateDate", "CreationDate")}
+    return result
+
+
+def build_farm(members: Dict[str, dict], farm_dir: Path, verbose: Callable) -> int:
+    """Hardlink every locally-present original into farm_dir as
+    <uuid>__<basename>. Rebuild is incremental; stale entries are removed.
+    Nothing inside the library is written or moved."""
+    farm_dir.mkdir(parents=True, exist_ok=True)
+    wanted: Dict[str, str] = {}
+    for uuid, m in sorted(members.items()):
+        if m.get("path"):
+            wanted[farm_name(uuid, m["path"])] = m["path"]
+    for existing in farm_dir.iterdir():
+        if existing.name not in wanted:
+            existing.unlink()
+    linked = 0
+    for name, src in wanted.items():
+        dst = farm_dir / name
+        if dst.exists():
+            linked += 1
+            continue
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)  # cross-device fallback; still read-only on src
+        linked += 1
+    verbose(f"farm: {linked:,} original(s) hardlinked in {farm_dir}")
+    return linked
+
+
+def run_czkawka(farm_dir: Path, out_dir: Path, near: int, verbose: Callable) -> None:
+    czkawka = shutil.which("czkawka_cli")
+    if not czkawka:
+        raise SystemExit("czkawka_cli not found on PATH (brew install czkawka)")
+    runs = [
+        ("dup", out_dir / "czkawka_dup.json",
+         [czkawka, "dup", "-d", str(farm_dir), "-m", "1024", "-s", "HASH"]),
+        ("image", out_dir / "czkawka_image.json",
+         [czkawka, "image", "-d", str(farm_dir), "-m", "1024", "-s", str(near)]),
+        ("video", out_dir / "czkawka_video.json",
+         [czkawka, "video", "-d", str(farm_dir), "-m", "1024"]),
+    ]
+    for label, json_path, cmd in runs:
+        verbose(f"czkawka {label}: scanning farm...")
+        proc = subprocess.run(cmd + ["-p", str(json_path), "-N", "-M", "-W"],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "").strip()[-400:]
+            verbose(f"  czkawka {label} failed (exit {proc.returncode}): {tail}")
+            verbose(f"  continuing; tranches will show as unverified for {label}")
+            json_path.write_text("[]")
+        else:
+            groups = czkawka_uuid_groups(json.loads(json_path.read_text() or "[]"))
+            verbose(f"  czkawka {label}: {len(groups):,} group(s) among farm files")
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    verbose = print
+
+    library = Path(args.library) if args.library else default_library_path()
+    db_path = library / "database" / "Photos.sqlite"
+    if not db_path.exists():
+        raise SystemExit(f"no Photos.sqlite under {library}")
+    wal = db_path.with_name(db_path.name + "-wal")
+    wal_bytes = wal.stat().st_size if wal.exists() else 0
+
+    reader = args.reader
+    if reader in ("auto", "osxphotos"):
+        reason = wal_refusal(wal_bytes, args.max_wal_gb)
+        if reason:
+            raise SystemExit(f"refusing --reader osxphotos: {reason}")
+        reader = "osxphotos"
+
+    verbose(f"Library: {library}")
+    conn = sqlite_ro(db_path)
+    try:
+        rows = read_apple_groups(conn)
+        generation = library_generation(conn, wal_bytes)
+        tranches = build_apple_tranches(rows)
+        verbose(f"Apple duplicate analysis: {len(rows):,} asset(s) in "
+                f"{len(tranches):,} group(s) "
+                f"(library: {generation['asset_count']:,} assets)")
+        if args.limit:
+            tranches = tranches[:args.limit]
+            verbose(f"--limit {args.limit}: keeping the first {len(tranches)} group(s)")
+        uuids: Set[str] = set()
+        for t in tranches:
+            uuids.update(t["members"])
+
+        if reader == "sqlite":
+            members = read_members_sqlite(conn, library, uuids, verbose)
+        else:
+            members, library = read_members_osxphotos(
+                Path(args.library) if args.library else None, uuids, verbose)
+    finally:
+        conn.close()
+
+    # drop members that could not be read at all, and groups that collapse
+    tranches = [dict(t, members=[u for u in t["members"] if u in members])
+                for t in tranches]
+    tranches = [t for t in tranches if len(t["members"]) >= 2]
+
+    exif = {} if args.skip_exif else run_exiftool(members, out_dir, verbose)
+    for uuid, tags in exif.items():
+        members[uuid]["exif"] = tags
+
+    if not args.skip_czkawka:
+        farm_members = {u: m for u, m in members.items() if u in uuids}
+        build_farm(farm_members, Path(args.farm_dir or (out_dir / "farm")), verbose)
+        run_czkawka(Path(args.farm_dir or (out_dir / "farm")), out_dir,
+                    args.near, verbose)
+
+    local = sum(1 for m in members.values() if m.get("path"))
+    scan = {
+        "version": PLAN_VERSION,
+        "script": SCRIPT,
+        "generated": datetime.now().strftime(ISO_FMT),
+        "library": str(library),
+        "reader": reader,
+        "generation": generation,
+        "near": args.near,
+        "apple_tranches": tranches,
+        "members": {u: members[u] for u in sorted(members)},
+    }
+    (out_dir / "scan.json").write_text(json.dumps(scan, indent=1, sort_keys=True))
+    verbose(f"\nWrote {out_dir / 'scan.json'}: {len(tranches):,} group(s), "
+            f"{len(members):,} member(s), {local:,} with local originals"
+            + ("" if local == len(members) else
+               f" ({len(members) - local:,} not downloaded -- czkawka cannot "
+               "verify those; consider 'Download Originals to this Mac')"))
+    verbose(f"Next: osxphotos run {SCRIPT} plan --out {out_dir}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# plan: pure computation from scan.json (+ czkawka JSON)
+# --------------------------------------------------------------------------
+
+def load_czkawka(out_dir: Path, name: str) -> List[Dict[str, dict]]:
+    path = out_dir / name
+    if not path.exists():
+        return []
+    try:
+        return czkawka_uuid_groups(json.loads(path.read_text() or "[]"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def build_plan(scan: dict, dup_groups, image_groups, video_groups,
+               min_year: int, spread_warn_days: float,
+               now: Optional[datetime] = None) -> dict:
+    """Deterministic: no timestamps, stable ordering, so identical inputs
+    produce byte-identical plan.json."""
+    now = now or datetime.now()
+    members: Dict[str, dict] = scan["members"]
+
+    tranches = []
+    for t in scan["apple_tranches"]:
+        ms = [members[u] for u in t["members"]]
+        tier, max_diff = tranche_tier(t["members"], members,
+                                      dup_groups, image_groups, video_groups)
+        m_date, source, spread, warnings = merged_date(
+            ms, min_year, now, spread_warn_days)
+        for m in ms:
+            for flag in m["flags"]:
+                if flag in VISIBILITY_FLAGS:
+                    warnings.append(f"unmergeable-member-{flag}")
+        if any("missing" in m["flags"] for m in ms):
+            warnings.append("missing-original")
+        kinds = {"video" if "video" in m["flags"] else "photo" for m in ms}
+        if len(kinds) > 1:
+            warnings.append("mixed-media")
+        burst_keys = [m.get("burst_key") for m in ms if m.get("burst_key")]
+        if len(burst_keys) >= 2 and len(set(burst_keys)) < len(ms):
+            warnings.append("burst-mates")
+        if tier in ("unverified", "partial"):
+            warnings.append(f"czkawka-{tier}")
+        warnings = sorted(set(warnings))
+        tranches.append({
+            "key": t["key"],
+            "sources": t["sources"],
+            "apple_groups": t["apple_groups"],
+            "members": t["members"],
+            "tier": tier,
+            "czkawka_max_diff": max_diff,
+            "keeper": choose_keeper(ms),
+            "merged_date": m_date,
+            "date_source": source,
+            "date_spread_days": spread,
+            "warnings": warnings,
+            "suggested": suggest_approve(tier, warnings),
+        })
+
+    tier_rank = {t: i for i, t in enumerate(TIER_ORDER)}
+    tranches.sort(key=lambda t: (tier_rank.get(t["tier"], 99), t["key"]))
+    for i, t in enumerate(tranches, start=1):
+        t["id"] = i
+
+    # czkawka links that cross Apple's group boundaries: a preview of what a
+    # full-library scan will add (czkawka relates assets Apple kept apart)
+    uuid_tranche = {u: t["key"] for t in tranches for u in t["members"]}
+    cross: Set[Tuple[str, str]] = set()
+    for groups in (dup_groups, image_groups, video_groups):
+        for g in groups:
+            keys = sorted({uuid_tranche.get(u) for u in g} - {None})
+            for a in range(len(keys)):
+                for b in range(a + 1, len(keys)):
+                    cross.add((keys[a], keys[b]))
+
+    tier_counts: Dict[str, int] = {}
+    warning_counts: Dict[str, int] = {}
+    for t in tranches:
+        tier_counts[t["tier"]] = tier_counts.get(t["tier"], 0) + 1
+        for w in t["warnings"]:
+            warning_counts[w] = warning_counts.get(w, 0) + 1
+
+    plan_body = {
+        "version": PLAN_VERSION,
+        "script": SCRIPT,
+        "library": scan["library"],
+        "reader": scan["reader"],
+        "generation": scan["generation"],
+        "policy": {
+            "keeper": "pixels desc, bytes desc, format rank, uuid",
+            "date": "oldest plausible candidate across tranche",
+            "min_plausible_year": min_year,
+            "date_spread_warn_days": spread_warn_days,
+            "near": scan.get("near"),
+        },
+        "summary": {
+            "tranches": len(tranches),
+            "members": sum(len(t["members"]) for t in tranches),
+            "losers": sum(len(t["members"]) - 1 for t in tranches),
+            "tiers": dict(sorted(tier_counts.items())),
+            "warnings": dict(sorted(warning_counts.items())),
+            "suggested_auto_approve": sum(1 for t in tranches if t["suggested"]),
+            "czkawka_cross_tranche_links": len(cross),
+        },
+        "tranches": tranches,
+        "members": {u: member_public(m) for u, m in sorted(members.items())},
+    }
+    plan_body["plan_key"] = hashlib.sha1(
+        json.dumps(plan_body, sort_keys=True).encode()).hexdigest()[:12]
+    return plan_body
+
+
+def uuid_file_lines(plan: dict, kind: str) -> List[str]:
+    """keepers.txt / losers.txt bodies. Tranches with unmergeable members or
+    no verification are written commented out, mirroring the convention of
+    graph_photo_dates.py (downstream --uuid-from-file consumers skip them)."""
+    lines = [f"# PROPOSED {kind} from {SCRIPT} plan -- review first; no "
+             "decisions applied"]
+    for t in plan["tranches"]:
+        blocked = [w for w in t["warnings"] if w.startswith("unmergeable")]
+        uuids = ([t["keeper"]] if kind == "keepers"
+                 else [u for u in t["members"] if u != t["keeper"]])
+        for u in uuids:
+            if blocked:
+                lines.append(f"# {u}  (tranche {t['id']}: {', '.join(blocked)})")
+            else:
+                lines.append(u)
+    return lines
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    out_dir = Path(args.out)
+    scan_path = out_dir / "scan.json"
+    if not scan_path.exists():
+        raise SystemExit(f"{scan_path} not found -- run scan first")
+    scan = json.loads(scan_path.read_text())
+    dup_groups = load_czkawka(out_dir, "czkawka_dup.json")
+    image_groups = load_czkawka(out_dir, "czkawka_image.json")
+    video_groups = load_czkawka(out_dir, "czkawka_video.json")
+
+    plan = build_plan(scan, dup_groups, image_groups, video_groups,
+                      args.min_plausible_year, args.date_spread_warn_days)
+    (out_dir / "plan.json").write_text(json.dumps(plan, indent=1, sort_keys=True))
+    for kind in ("keepers", "losers"):
+        (out_dir / f"{kind}.txt").write_text(
+            "\n".join(uuid_file_lines(plan, kind)) + "\n")
+
+    s = plan["summary"]
+    print(f"Plan: {s['tranches']:,} tranche(s), {s['members']:,} member(s), "
+          f"{s['losers']:,} proposed removal(s)")
+    print(f"Tiers: " + ", ".join(f"{k}={v}" for k, v in s["tiers"].items()))
+    if s["warnings"]:
+        print("Warnings: " + ", ".join(f"{k}={v}" for k, v in s["warnings"].items()))
+    print(f"Suggested auto-approvals (exact/visual-0, no warnings): "
+          f"{s['suggested_auto_approve']:,}")
+    if s["czkawka_cross_tranche_links"]:
+        print(f"Note: czkawka links {s['czkawka_cross_tranche_links']:,} pair(s) "
+              "of tranches Apple kept apart -- the full-library scan (phase 2) "
+              "will surface those properly.")
+    print(f"\nWrote {out_dir / 'plan.json'}, keepers.txt, losers.txt")
+    print(f"Next: osxphotos run {SCRIPT} review --out {out_dir} --open")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# review: thumbnails + static HTML gallery
+# --------------------------------------------------------------------------
+
+def make_thumb(src: str, dst: Path, is_video: bool, px: int) -> bool:
+    if dst.exists():
+        return True
+    if not src or not os.path.exists(src):
+        return False
+    if is_video and not src.lower().endswith((".jpg", ".jpeg", ".png", ".heic")):
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return False
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-ss", "1", "-i", src,
+             "-frames:v", "1", "-vf", f"scale={px}:-2", str(dst)],
+            capture_output=True)
+        return proc.returncode == 0 and dst.exists()
+    proc = subprocess.run(
+        ["sips", "-s", "format", "jpeg", "-Z", str(px), src, "--out", str(dst)],
+        capture_output=True)
+    return proc.returncode == 0 and dst.exists()
+
+
+def render_report(plan: dict, thumbs_ok: Set[str]) -> str:
+    """Static review page. All member data reaches the DOM via textContent
+    (never innerHTML), so filenames and titles cannot inject markup."""
+    data = {
+        "plan_key": plan["plan_key"],
+        "summary": plan["summary"],
+        "policy": plan["policy"],
+        "library": plan["library"],
+        "tranches": plan["tranches"],
+        "members": {
+            u: {k: m.get(k) for k in
+                ("uuid", "filename", "ext", "size", "width", "height",
+                 "photos_date", "date_added", "favorite", "flags", "albums",
+                 "keywords", "title", "description", "exif")}
+            for u, m in plan["members"].items()
+        },
+        "thumbs": sorted(thumbs_ok),
+    }
+    # <-escape every "<" so nothing in the data can ever terminate the
+    # <script> block or read as markup ("<" never occurs in JSON syntax, so
+    # the global replace only touches string contents)
+    payload = json.dumps(data, sort_keys=True).replace("<", "\\u003c")
+    return REPORT_TEMPLATE.replace("__DATA__", payload)
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    out_dir = Path(args.out)
+    plan_path = out_dir / "plan.json"
+    if not plan_path.exists():
+        raise SystemExit(f"{plan_path} not found -- run plan first")
+    plan = json.loads(plan_path.read_text())
+
+    report_dir = out_dir / "report"
+    thumbs_dir = report_dir / "thumbs"
+    thumbs_dir.mkdir(parents=True, exist_ok=True)
+
+    thumbs_ok: Set[str] = set()
+    members = plan["members"]
+    wanted = [u for t in plan["tranches"] for u in t["members"]]
+    if args.skip_thumbs:
+        thumbs_ok = {u for u in wanted if (thumbs_dir / f"{u}.jpg").exists()}
+    else:
+        print(f"thumbnails: {len(wanted):,} member(s)...")
+        for i, uuid in enumerate(wanted, start=1):
+            m = members[uuid]
+            if make_thumb(m.get("thumb_source") or m.get("path") or "",
+                          thumbs_dir / f"{uuid}.jpg",
+                          "video" in m.get("flags", []), args.thumb_size):
+                thumbs_ok.add(uuid)
+            if i % 500 == 0:
+                print(f"  {i:,}/{len(wanted):,}")
+
+    index = report_dir / "index.html"
+    index.write_text(render_report(plan, thumbs_ok), encoding="utf-8")
+    missing = len(wanted) - len(thumbs_ok)
+    print(f"Wrote {index} ({len(plan['tranches']):,} tranche(s)"
+          + (f", {missing:,} thumbnail(s) unavailable" if missing else "") + ")")
+    print("Open it, review, then use 'Export decisions' -- the downloaded "
+          "decisions.json is the input to the future apply stage.")
+    if args.open:
+        subprocess.run(["open", str(index)], check=False)
+    return 0
+
+
+REPORT_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Photos duplicate review</title>
+<style>
+:root { color-scheme: light dark; }
+body { font: 14px/1.45 -apple-system, system-ui, sans-serif; margin: 0;
+       background: Canvas; color: CanvasText; }
+header { position: sticky; top: 0; background: Canvas; border-bottom: 1px solid
+         color-mix(in srgb, CanvasText 20%, Canvas); padding: 10px 16px;
+         display: flex; gap: 12px; align-items: center; flex-wrap: wrap; z-index: 2; }
+header .counts { font-variant-numeric: tabular-nums; }
+button, select { font: inherit; padding: 4px 10px; }
+main { padding: 12px 16px 80px; max-width: 1300px; margin: 0 auto; }
+.card { border: 1px solid color-mix(in srgb, CanvasText 22%, Canvas);
+        border-radius: 10px; margin: 14px 0; padding: 10px 12px; }
+.card.approved { border-color: #2e9e44; box-shadow: 0 0 0 1px #2e9e44 inset; }
+.card.rejected { border-color: #c33; opacity: .6; }
+.card h3 { margin: 0 0 6px; font-size: 14px; display: flex; gap: 8px;
+           align-items: baseline; flex-wrap: wrap; }
+.chip { font-size: 11px; padding: 1px 8px; border-radius: 999px;
+        background: color-mix(in srgb, CanvasText 12%, Canvas); }
+.chip.tier-exact, .chip.tier-visual-0 { background: #2e9e4433; }
+.chip.tier-near, .chip.tier-video { background: #e8a02033; }
+.chip.tier-partial, .chip.tier-unverified { background: #cc333333; }
+.chip.warn { background: #cc333322; }
+.dateline { margin: 2px 0 8px; }
+.dateline b { color: #2e9e44; }
+.members { display: flex; gap: 10px; overflow-x: auto; }
+.member { min-width: 230px; max-width: 300px; border: 1px solid
+          color-mix(in srgb, CanvasText 15%, Canvas); border-radius: 8px;
+          padding: 8px; }
+.member.keeper { border-color: #2e9e44; }
+.member img { max-width: 100%; max-height: 190px; display: block;
+              margin: 0 auto 6px; border-radius: 4px; object-fit: contain; }
+.member .noimg { height: 100px; display: flex; align-items: center;
+                 justify-content: center; font-size: 32px; opacity: .4; }
+.member .name { font-weight: 600; word-break: break-all; }
+.member table { border-collapse: collapse; margin-top: 4px; width: 100%; }
+.member td { padding: 0 6px 1px 0; vertical-align: top; font-size: 12px; }
+.member td:first-child { opacity: .55; white-space: nowrap; }
+.suspect { text-decoration: line-through; opacity: .6; }
+.oldest { color: #2e9e44; font-weight: 600; }
+.actions { margin-top: 8px; display: flex; gap: 8px; align-items: center; }
+.spacer { flex: 1; }
+footer.load { text-align: center; padding: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <strong>Duplicate review</strong>
+  <span class="counts" id="counts"></span>
+  <select id="filter">
+    <option value="all">all</option>
+    <option value="undecided" selected>undecided</option>
+    <option value="approved">approved</option>
+    <option value="rejected">rejected</option>
+    <option value="warnings">with warnings</option>
+    <option value="exact">tier: exact</option>
+    <option value="visual-0">tier: visual-0</option>
+    <option value="near">tier: near</option>
+    <option value="video">tier: video</option>
+    <option value="partial">tier: partial</option>
+    <option value="unverified">tier: unverified</option>
+  </select>
+  <button id="approve-shown">Approve all shown</button>
+  <button id="clear-shown">Clear shown</button>
+  <span class="spacer"></span>
+  <button id="export">Export decisions</button>
+  <label><input type="file" id="import" hidden>
+    <button onclick="document.getElementById('import').click()">Import</button>
+  </label>
+</header>
+<main id="list"></main>
+<footer class="load"><button id="more" hidden>Show more</button></footer>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+"use strict";
+const DATA = JSON.parse(document.getElementById("data").textContent);
+const KEY = "dedupe-decisions-" + DATA.plan_key;
+const THUMBS = new Set(DATA.thumbs);
+let dec = {};
+try { dec = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
+const save = () => localStorage.setItem(KEY, JSON.stringify(dec));
+const PAGE = 100;
+let shown = PAGE;
+
+const state = k => (dec[k] && dec[k].d) || "undecided";
+const keeperOf = t => (dec[t.key] && dec[t.key].k) || t.keeper;
+
+function matches(t, f) {
+  if (f === "all") return true;
+  if (f === "warnings") return t.warnings.length > 0;
+  if (["undecided", "approved", "rejected"].includes(f)) return state(t.key) === f;
+  return t.tier === f;
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function hsize(n) {
+  if (!n) return "?";
+  const u = ["B", "KB", "MB", "GB"]; let i = 0, s = n;
+  while (s >= 1024 && i < 3) { s /= 1024; i++; }
+  return i ? s.toFixed(1) + " " + u[i] : s + " B";
+}
+
+function memberCard(t, uuid) {
+  const m = DATA.members[uuid];
+  const card = el("div", "member" + (keeperOf(t) === uuid ? " keeper" : ""));
+  if (THUMBS.has(uuid)) {
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.src = "thumbs/" + uuid + ".jpg";
+    card.appendChild(img);
+  } else {
+    card.appendChild(el("div", "noimg",
+      (m.flags || []).includes("video") ? "▶" : "✖"));
+  }
+  card.appendChild(el("div", "name",
+    ((m.flags || []).includes("video") ? "▶ " : "") + (m.filename || uuid)));
+  const tbl = document.createElement("table");
+  const oldest = t.merged_date;
+  const row = (k, v, cls) => {
+    const tr = document.createElement("tr");
+    tr.appendChild(el("td", "", k));
+    tr.appendChild(el("td", cls || "", v || "—"));
+    tbl.appendChild(tr);
+  };
+  row("dims", (m.width || "?") + "×" + (m.height || "?") +
+      "  " + hsize(m.size) + "  ." + (m.ext || "?"));
+  const dateRow = (label, val) => {
+    if (!val) return;
+    let cls = "";
+    if (val === oldest) cls = "oldest";
+    row(label, val.replace("T", " "), cls);
+  };
+  dateRow("photos", m.photos_date);
+  const ex = m.exif || {};
+  dateRow("exif dto", cleanExif(ex.DateTimeOriginal));
+  dateRow("exif create", cleanExif(ex.CreateDate));
+  dateRow("exif creation", cleanExif(ex.CreationDate));
+  row("added", (m.date_added || "—").replace("T", " "));
+  if ((m.flags || []).length) row("flags", m.flags.join(", "));
+  if ((m.albums || []).length) row("albums", m.albums.join(", "));
+  if ((m.keywords || []).length) row("keywords", m.keywords.join(", "));
+  card.appendChild(tbl);
+  const pick = el("label", "", " keeper");
+  const radio = document.createElement("input");
+  radio.type = "radio"; radio.name = "k-" + t.key;
+  radio.checked = keeperOf(t) === uuid;
+  radio.onchange = () => { dec[t.key] = dec[t.key] || {}; dec[t.key].k = uuid;
+                           save(); render(); };
+  pick.prepend(radio);
+  card.appendChild(pick);
+  return card;
+}
+
+function cleanExif(v) {
+  if (!v || typeof v !== "string" || v.startsWith("-") || v.startsWith("0000")) return null;
+  return v;
+}
+
+function trancheCard(t) {
+  const card = el("div", "card " + state(t.key));
+  const h = el("h3");
+  h.appendChild(el("span", "", "#" + t.id));
+  h.appendChild(el("span", "chip tier-" + t.tier,
+    t.tier + (t.czkawka_max_diff != null ? " d" + t.czkawka_max_diff : "")));
+  t.sources.forEach(s => h.appendChild(el("span", "chip", s.replace("apple-", " "))));
+  t.warnings.forEach(w => h.appendChild(el("span", "chip warn", w)));
+  card.appendChild(h);
+  const dl = el("div", "dateline");
+  dl.appendChild(el("span", "", "merged date "));
+  dl.appendChild(el("b", "", (t.merged_date || "none").replace("T", " ")));
+  dl.appendChild(el("span", "", "  from " + (t.date_source || "?") +
+    (t.date_spread_days ? "  (spread " + t.date_spread_days + "d)" : "")));
+  card.appendChild(dl);
+  const row = el("div", "members");
+  t.members.forEach(u => row.appendChild(memberCard(t, u)));
+  card.appendChild(row);
+  const actions = el("div", "actions");
+  const mk = (label, d) => {
+    const b = el("button", "", label);
+    b.onclick = () => { dec[t.key] = dec[t.key] || {};
+      dec[t.key].d = state(t.key) === d ? undefined : d;
+      if (!dec[t.key].d) delete dec[t.key].d;
+      if (!Object.keys(dec[t.key]).length) delete dec[t.key];
+      save(); render(); };
+    return b;
+  };
+  actions.appendChild(mk("Approve", "approved"));
+  actions.appendChild(mk("Reject", "rejected"));
+  if (t.suggested) actions.appendChild(el("span", "chip", "suggested"));
+  card.appendChild(actions);
+  return card;
+}
+
+function counts() {
+  let a = 0, r = 0;
+  DATA.tranches.forEach(t => {
+    const s = state(t.key);
+    if (s === "approved") a++; else if (s === "rejected") r++;
+  });
+  document.getElementById("counts").textContent =
+    DATA.tranches.length + " tranches · " + a + " approved · " +
+    r + " rejected · " + (DATA.tranches.length - a - r) + " undecided";
+}
+
+function render() {
+  const f = document.getElementById("filter").value;
+  const list = document.getElementById("list");
+  list.textContent = "";
+  const vis = DATA.tranches.filter(t => matches(t, f));
+  vis.slice(0, shown).forEach(t => list.appendChild(trancheCard(t)));
+  document.getElementById("more").hidden = vis.length <= shown;
+  counts();
+}
+
+document.getElementById("filter").onchange = () => { shown = PAGE; render(); };
+document.getElementById("more").onclick = () => { shown += PAGE; render(); };
+document.getElementById("approve-shown").onclick = () => {
+  const f = document.getElementById("filter").value;
+  DATA.tranches.filter(t => matches(t, f)).forEach(t => {
+    dec[t.key] = dec[t.key] || {}; dec[t.key].d = "approved"; });
+  save(); render();
+};
+document.getElementById("clear-shown").onclick = () => {
+  const f = document.getElementById("filter").value;
+  DATA.tranches.filter(t => matches(t, f)).forEach(t => {
+    if (dec[t.key]) { delete dec[t.key].d;
+      if (!Object.keys(dec[t.key]).length) delete dec[t.key]; } });
+  save(); render();
+};
+document.getElementById("export").onclick = () => {
+  const out = { version: 1, plan_key: DATA.plan_key, decisions: dec };
+  const blob = new Blob([JSON.stringify(out, null, 1)],
+                        { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "decisions.json";
+  a.click();
+};
+document.getElementById("import").onchange = ev => {
+  const file = ev.target.files[0];
+  if (!file) return;
+  file.text().then(txt => {
+    const obj = JSON.parse(txt);
+    if (obj.plan_key !== DATA.plan_key &&
+        !confirm("decisions.json is for a different plan; import anyway?")) return;
+    Object.assign(dec, obj.decisions || {});
+    save(); render();
+  });
+};
+render();
+</script>
+</body>
+</html>
+"""
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def add_out(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--out", default=DEFAULT_OUT, metavar="DIR",
+                   help=f"working directory (default {DEFAULT_OUT})")
+
+
+def add_scan_args(p: argparse.ArgumentParser) -> None:
+    add_out(p)
+    p.add_argument("--library", metavar="PATH",
+                   help="Photos library (default: last-opened)")
+    p.add_argument("--reader", choices=("auto", "osxphotos", "sqlite"),
+                   default="auto",
+                   help="metadata reader (default auto = osxphotos, refused "
+                   "while the WAL is huge; sqlite reads live, fewer fields)")
+    p.add_argument("--limit", type=int, metavar="N",
+                   help="only the first N Apple groups (smoke tests)")
+    p.add_argument("--near", type=int, default=DEFAULT_NEAR,
+                   help=f"czkawka image max distance (default {DEFAULT_NEAR})")
+    p.add_argument("--skip-czkawka", action="store_true",
+                   help="skip the czkawka verification runs")
+    p.add_argument("--skip-exif", action="store_true",
+                   help="skip the exiftool date harvest")
+    p.add_argument("--farm-dir", metavar="PATH",
+                   help="hardlink farm location (default <out>/farm)")
+    p.add_argument("--max-wal-gb", type=float, default=DEFAULT_MAX_WAL_GB,
+                   help="refuse the osxphotos reader above this WAL size "
+                   f"(default {DEFAULT_MAX_WAL_GB:g})")
+
+
+def add_plan_args(p: argparse.ArgumentParser) -> None:
+    add_out(p)
+    p.add_argument("--min-plausible-year", type=int,
+                   default=DEFAULT_MIN_PLAUSIBLE_YEAR, metavar="YEAR",
+                   help="dates before this year are implausible "
+                   f"(default {DEFAULT_MIN_PLAUSIBLE_YEAR})")
+    p.add_argument("--date-spread-warn-days", type=float,
+                   default=DEFAULT_SPREAD_WARN_DAYS, metavar="DAYS",
+                   help="warn when a tranche's plausible dates span more "
+                   f"(default {DEFAULT_SPREAD_WARN_DAYS:g})")
+
+
+def add_review_args(p: argparse.ArgumentParser) -> None:
+    add_out(p)
+    p.add_argument("--open", action="store_true",
+                   help="open the report in the default browser")
+    p.add_argument("--thumb-size", type=int, default=DEFAULT_THUMB_PX,
+                   help=f"thumbnail long edge in px (default {DEFAULT_THUMB_PX})")
+    p.add_argument("--skip-thumbs", action="store_true",
+                   help="reuse existing thumbnails only")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=SCRIPT,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Deterministic duplicate merge planning for Apple Photos: "
+        "Apple's own Duplicates analysis, verified by czkawka, reviewed in "
+        "HTML. Read-only; nothing in the library is modified.",
+        epilog=f"""\
+examples:
+  osxphotos run {SCRIPT} all --open              # scan + plan + review
+  osxphotos run {SCRIPT} scan --reader sqlite    # while the WAL is huge / mid-import
+  osxphotos run {SCRIPT} scan --limit 5          # smoke test on 5 groups
+  osxphotos run {SCRIPT} plan --min-plausible-year 1985
+  osxphotos run {SCRIPT} review --open
+  python3 {SCRIPT} --selftest                    # offline tests, safe anywhere
+""")
+    parser.add_argument("--selftest", action="store_true",
+                        help="run offline self-tests and exit")
+    sub = parser.add_subparsers(dest="command")
+    add_scan_args(sub.add_parser("scan", help="read Apple groups + czkawka verify"))
+    add_plan_args(sub.add_parser("plan", help="compute deterministic merge plan"))
+    add_review_args(sub.add_parser("review", help="render the HTML review gallery"))
+    p_all = sub.add_parser("all", help="scan, plan, review in sequence")
+    add_scan_args(p_all)
+    p_all.add_argument("--min-plausible-year", type=int,
+                       default=DEFAULT_MIN_PLAUSIBLE_YEAR)
+    p_all.add_argument("--date-spread-warn-days", type=float,
+                       default=DEFAULT_SPREAD_WARN_DAYS)
+    p_all.add_argument("--open", action="store_true")
+    p_all.add_argument("--thumb-size", type=int, default=DEFAULT_THUMB_PX)
+    p_all.add_argument("--skip-thumbs", action="store_true")
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.selftest:
+        selftest()
+        return 0
+    if not args.command:
+        parser.print_help()
+        return 2
+    if args.command == "scan":
+        return cmd_scan(args)
+    if args.command == "plan":
+        return cmd_plan(args)
+    if args.command == "review":
+        return cmd_review(args)
+    if args.command == "all":
+        rc = cmd_scan(args)
+        if rc:
+            return rc
+        rc = cmd_plan(args)
+        if rc:
+            return rc
+        return cmd_review(args)
+    return 2
+
+
+# --------------------------------------------------------------------------
+# selftest (offline; no Photos library, no external binaries)
+# --------------------------------------------------------------------------
+
+def _member(uuid, filename="f.jpg", w=100, h=100, size=1000, ext=None,
+            photos_date=None, exif=None, flags=(), burst_key=None) -> dict:
+    return {
+        "uuid": uuid, "filename": filename,
+        "ext": ext if ext is not None else filename.rsplit(".", 1)[-1],
+        "path": None, "thumb_source": None, "size": size,
+        "width": w, "height": h, "photos_date": photos_date,
+        "date_added": None, "favorite": False, "flags": list(flags),
+        "burst_key": burst_key, "albums": [], "keywords": [],
+        "title": None, "description": None, "reader": "test",
+        **({"exif": exif} if exif else {}),
+    }
+
+
+def selftest() -> None:
+    now = datetime(2026, 7, 28, 12, 0, 0)
+
+    # datetime plumbing
+    assert parse_exif_dt("2016-08-19T09:12:44") == datetime(2016, 8, 19, 9, 12, 44)
+    assert parse_exif_dt("2016:08:19 09:12:44") == datetime(2016, 8, 19, 9, 12, 44)
+    off = parse_exif_dt("2016-08-19T09:12:44+00:00")
+    assert off is not None and off.tzinfo is None  # converted to local naive
+    assert parse_exif_dt("2016-08-19T09:12:44+0200") is not None
+    assert parse_exif_dt("2016-08-19T09:12:44Z") is not None
+    for bad in (None, "", "-", "0000:00:00 00:00:00", "garbage", 42):
+        assert parse_exif_dt(bad) is None, bad
+    assert core_data_to_local(0) is None
+    assert core_data_to_local(None) is None
+    utc_probe = core_data_to_local(86400)
+    assert utc_probe is not None and utc_probe.tzinfo is None
+    assert iso(datetime(2020, 1, 2, 3, 4, 5)) == "2020-01-02T03:04:05"
+    assert parse_iso("2020-01-02T03:04:05") == datetime(2020, 1, 2, 3, 4, 5)
+    assert parse_iso(None) is None
+
+    # suspect dates
+    assert is_suspect_date(datetime(1970, 1, 1), 1990, now)
+    assert is_suspect_date(datetime(1904, 1, 1), 1800, now)  # epoch even if old ok
+    assert is_suspect_date(datetime(1989, 12, 31), 1990, now)
+    assert not is_suspect_date(datetime(1990, 1, 1), 1990, now)
+    assert is_suspect_date(datetime(2026, 7, 30), 1990, now)  # future
+    assert not is_suspect_date(datetime(2026, 7, 29, 6, 0), 1990, now)  # <1d grace
+
+    # keeper policy: pixels, then bytes, then format, then uuid
+    a = _member("B-BIG", "big.jpg", w=4000, h=3000, size=100)
+    b = _member("A-SMALL", "small.jpg", w=100, h=100, size=999999)
+    assert choose_keeper([a, b]) == "B-BIG"
+    c = _member("C", "c.jpg", w=4000, h=3000, size=200)
+    assert choose_keeper([a, c]) == "C"  # same pixels, more bytes
+    d = _member("D", "d.heic", w=4000, h=3000, size=200)
+    assert choose_keeper([c, d]) == "D"  # same pixels+bytes, heic beats jpg
+    e = _member("A-TIE", "e.heic", w=4000, h=3000, size=200)
+    assert choose_keeper([d, e]) == "A-TIE"  # uuid tiebreak, stable
+    assert format_rank("DNG") < format_rank("heic") < format_rank("png") \
+        < format_rank("jpg") < format_rank("mov") < format_rank("xyz")
+
+    # merged date: oldest plausible across members and EXIF
+    m1 = _member("U1", "a.jpg", photos_date="2019-06-02T14:11:03",
+                 exif={"DateTimeOriginal": "2016-08-19T09:12:44"})
+    m2 = _member("U2", "b.jpg", photos_date="2019-06-02T14:11:03")
+    dt, src, spread, warns = merged_date([m1, m2], 1990, now, 2.0)
+    assert dt == "2016-08-19T09:12:44" and src == "exif-dto:a.jpg"
+    assert spread > 1000 and any(w.startswith("date-spread") for w in warns)
+
+    m3 = _member("U3", "c.jpg", photos_date="2019-06-02T14:11:04")
+    dt, src, spread, warns = merged_date([m2, m3], 1990, now, 2.0)
+    assert dt == "2019-06-02T14:11:03" and src == "photos:b.jpg" and warns == []
+
+    bogus = _member("U4", "d.jpg", photos_date="1970-01-01T00:00:00")
+    dt, src, spread, warns = merged_date([bogus], 1990, now, 2.0)
+    assert dt == "1970-01-01T00:00:00" and "all-dates-suspect" in warns
+    dt, _, _, warns = merged_date([_member("U5", "e.jpg")], 1990, now, 2.0)
+    assert dt is None and warns == ["no-dates"]
+
+    # tranche building: shared groups merge, bridging works, singletons drop
+    rows = [("U1", 10, None), ("U2", 10, None), ("U3", None, 20),
+            ("U4", 11, 20), ("U5", 11, None), ("LONELY", 99, None)]
+    tr = build_apple_tranches(rows)
+    assert len(tr) == 2
+    sizes = sorted(len(t["members"]) for t in tr)
+    assert sizes == [2, 3]  # {U1,U2} and {U3,U4,U5} bridged via group 11+20
+    bridged = next(t for t in tr if len(t["members"]) == 3)
+    assert bridged["members"] == ["U3", "U4", "U5"]
+    assert bridged["sources"] == ["apple-metadata", "apple-perceptual"]
+    assert tranche_key(["b", "a"]) == tranche_key(["A", "B"])
+    assert tr == sorted(tr, key=lambda t: t["key"])
+
+    # farm names round-trip
+    assert farm_uuid(farm_name("ABC-123", "/x/y/IMG__weird__name.HEIC")) == "ABC-123"
+    assert farm_uuid("abc-1__file.jpg") == "ABC-1"
+
+    # czkawka JSON normalization: image (list) and dup (dict) shapes
+    img_json = [[{"path": "/f/U1__a.jpg", "difference": 0},
+                 {"path": "/f/U2__b.jpg", "difference": 3},
+                 {"path": "/f/stray.jpg", "difference": 9}]]
+    dup_json = {"1000": [[{"path": "/f/U1__a.jpg"}, {"path": "/f/U2__b.jpg"}]]}
+    ig = czkawka_uuid_groups(img_json)
+    dg = czkawka_uuid_groups(dup_json)
+    assert len(ig) == 1 and set(ig[0]) == {"U1", "U2"}
+    assert len(dg) == 1 and set(dg[0]) == {"U1", "U2"}
+
+    # tiers
+    mem = {"U1": _member("U1", w=100, h=100), "U2": _member("U2", w=100, h=100),
+           "U3": _member("U3", w=200, h=100)}
+    assert tranche_tier(["U1", "U2"], mem, dg, ig, []) == ("exact", None)
+    assert tranche_tier(["U1", "U2"], mem, [], ig, []) == ("near", 3)
+    ig0 = czkawka_uuid_groups([[{"path": "/f/U1__a.jpg", "difference": 0},
+                                {"path": "/f/U2__b.jpg", "difference": 0}]])
+    assert tranche_tier(["U1", "U2"], mem, [], ig0, []) == ("visual-0", 0)
+    assert tranche_tier(["U1", "U3"], mem, [], ig0, []) == ("unverified", None)
+    assert tranche_tier(["U1", "U2", "U3"], mem, [], ig, []) == ("partial", 3)
+    vg = czkawka_uuid_groups([[{"path": "/f/U1__a.mov"}, {"path": "/f/U2__b.mov"}]])
+    assert tranche_tier(["U1", "U2"], mem, [], [], vg) == ("video", None)
+    assert suggest_approve("exact", []) and not suggest_approve("exact", ["x"])
+    assert not suggest_approve("near", [])
+
+    # WAL guard
+    assert wal_refusal(1024**3, 2.0) is None
+    assert "GB" in (wal_refusal(3 * 1024**3, 2.0) or "")
+
+    # plan build: deterministic, warnings, uuid files
+    scan = {
+        "version": 1, "script": SCRIPT, "library": "/lib", "reader": "test",
+        "generation": {"asset_count": 2, "max_pk": 2, "wal_bytes": 0},
+        "near": 10,
+        "apple_tranches": build_apple_tranches([("U1", 1, None), ("U2", 1, None),
+                                                ("H1", 2, None), ("H2", 2, None)]),
+        "members": {
+            "U1": _member("U1", "a.jpg", w=200, h=200,
+                          photos_date="2019-06-02T14:11:03"),
+            "U2": _member("U2", "b.jpg", w=100, h=100,
+                          photos_date="2019-06-02T14:11:04"),
+            "H1": _member("H1", "h1.jpg", photos_date="2020-01-01T00:00:00",
+                          flags=("hidden",)),
+            "H2": _member("H2", "h2.jpg", photos_date="2020-01-01T00:00:01"),
+        },
+    }
+    plan1 = build_plan(scan, dg, ig, [], 1990, 2.0, now=now)
+    plan2 = build_plan(scan, dg, ig, [], 1990, 2.0, now=now)
+    assert json.dumps(plan1, sort_keys=True) == json.dumps(plan2, sort_keys=True)
+    by_members = {tuple(t["members"]): t for t in plan1["tranches"]}
+    t12 = by_members[("U1", "U2")]
+    assert t12["tier"] == "exact" and t12["keeper"] == "U1"
+    assert t12["merged_date"] == "2019-06-02T14:11:03"
+    assert t12["suggested"]
+    th = by_members[("H1", "H2")]
+    assert "unmergeable-member-hidden" in th["warnings"]
+    assert "czkawka-unverified" in th["warnings"] and not th["suggested"]
+    assert plan1["summary"]["tranches"] == 2
+    assert plan1["summary"]["losers"] == 2
+    assert plan1["tranches"][0]["id"] == 1  # exact sorts before unverified
+    assert plan1["tranches"][0]["tier"] == "exact"
+    losers = uuid_file_lines(plan1, "losers")
+    keepers = uuid_file_lines(plan1, "keepers")
+    assert "U2" in losers and "U1" in keepers
+    assert any(line.startswith("# H") for line in losers)  # blocked, commented
+    assert sum(1 for l in keepers if not l.startswith("#")) == 1
+
+    # report rendering: data embedded safely, member data not inlined as HTML
+    plan1_members = plan1["members"]
+    plan1_members["U1"]["filename"] = '<img src=x onerror=alert(1)>.jpg'
+    html_text = render_report(plan1, {"U1"})
+    assert "__DATA__" not in html_text
+    assert "<img src=x onerror" not in html_text  # every "<" is <-escaped
+    assert "\\u003cimg src=x onerror=alert(1)>.jpg" in html_text
+    assert 'type="application/json"' in html_text
+
+    # burst + mixed-media warnings
+    scan2 = {
+        **scan,
+        "apple_tranches": build_apple_tranches([("B1", 5, None), ("B2", 5, None)]),
+        "members": {
+            "B1": _member("B1", "b1.jpg", photos_date="2020-01-01T00:00:00",
+                          burst_key="BK", flags=("video",)),
+            "B2": _member("B2", "b2.jpg", photos_date="2020-01-01T00:00:01",
+                          burst_key="BK"),
+        },
+    }
+    planb = build_plan(scan2, [], [], [], 1990, 2.0, now=now)
+    wb = planb["tranches"][0]["warnings"]
+    assert "burst-mates" in wb and "mixed-media" in wb
+
+    print("selftest OK")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
