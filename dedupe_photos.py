@@ -67,12 +67,17 @@ tools over the farm. Each tranche is annotated with a verification tier:
     partial     czkawka matched some but not all members
     unverified  czkawka found no relation (Apple-only claim) -- review these!
 
-The review page (static HTML, no server, no dependencies) shows each tranche
-side by side: thumbnails, metadata, every date candidate (implausible ones
-struck through), the proposed keeper (switchable) and merged date. Approve /
-reject per tranche, bulk-approve by tier, then Export writes decisions.json
-for the future apply stage. Decisions persist in browser localStorage keyed
-by plan fingerprint.
+The review page (static HTML, no dependencies) shows each tranche side by
+side: thumbnails, metadata, every date candidate (implausible ones struck
+through), the proposed keeper and merged date. Click anywhere on a member
+card to make it the keeper. Vim-style keys (? shows the map): j/k/gg/G
+navigate, a/x approve/reject and advance, u clears, n next undecided, h/l
+cycle keeper, o reveals the keeper in Photos.app. Approve/reject in bulk,
+then Export writes decisions.json for apply. Decisions persist in browser
+localStorage keyed by plan fingerprint. `review --serve [PORT]` serves the
+page on 127.0.0.1 (default 8942) and enables reveal-in-Photos (per-member
+buttons + the o key) via a /reveal endpoint that AppleScript-spotlights the
+asset; uuids are validated against the plan.
 
 Everything is read-only toward the Photos library: the database is opened
 read-only, farm entries are hardlinks, czkawka never deletes (its delete
@@ -263,9 +268,15 @@ def merged_date(members: List[dict], min_year: int, now: datetime,
                 spread_warn_days: float) -> Tuple[Optional[str], Optional[str], float, List[str]]:
     """The oldest plausible timestamp across the whole tranche.
 
-    Returns (iso date, source label, spread in days over the plausible pool,
-    warnings). If every candidate is implausible, falls back to the oldest
-    Photos date and says so."""
+    Returns (iso date, source label, spread in days, warnings). If every
+    candidate is implausible, falls back to the oldest Photos date and says
+    so.
+
+    The spread (and its warning) measures disagreement among EXIF/QuickTime
+    candidates ONLY. Duplicates re-imported on different days routinely carry
+    different Photos dates -- fixing that silently is this tool's job, not a
+    reason for review scrutiny. Two capture-metadata candidates disagreeing,
+    however, means something recorded the moment wrong: that deserves eyes."""
     pool: List[Tuple[str, str, datetime]] = []  # (label, filename, dt)
     all_cands: List[Tuple[str, str, datetime]] = []
     for m in members:
@@ -283,7 +294,11 @@ def merged_date(members: List[dict], min_year: int, now: datetime,
         pool = photos_only
 
     label, fname, dt = min(pool, key=lambda c: (c[2], c[0], c[1]))
-    spread = round((max(c[2] for c in pool) - min(c[2] for c in pool)).total_seconds() / 86400, 1)
+    exif_pool = [c for c in pool if c[0] != "photos"]
+    spread = 0.0
+    if len(exif_pool) >= 2:
+        spread = round((max(c[2] for c in exif_pool)
+                        - min(c[2] for c in exif_pool)).total_seconds() / 86400, 1)
     if spread > spread_warn_days:
         warnings.append(f"date-spread-{spread}d")
     return iso(dt), f"{label}:{fname}", spread, warnings
@@ -1062,6 +1077,66 @@ def render_report(plan: dict, thumbs_ok: Set[str]) -> str:
     return REPORT_TEMPLATE.replace("__DATA__", payload)
 
 
+_UUID_RE = re.compile(r"[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}")
+
+
+def _reveal_allowed(uuid, allowed: Set[str]) -> bool:
+    """Only well-formed uuids that the plan actually contains may be passed
+    to AppleScript -- the page can only reveal assets it already shows."""
+    if not isinstance(uuid, str):
+        return False
+    uuid = _norm_uuid(uuid)
+    return bool(_UUID_RE.fullmatch(uuid)) and uuid in allowed
+
+
+def serve_report(report_dir: Path, port: int, allowed: Set[str],
+                 open_browser: bool) -> int:
+    """Serve the report on 127.0.0.1 so the page gains a /reveal endpoint:
+    GET /reveal?uuid=X spotlights that asset in Photos.app via AppleScript
+    (the same reveal `osxphotos show` does)."""
+    import http.server
+    from functools import partial
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *log_args):  # keep the terminal quiet
+            pass
+
+        def do_GET(self):
+            if not self.path.startswith("/reveal"):
+                return super().do_GET()
+            query = urllib.parse.urlparse(self.path).query
+            uuid = (urllib.parse.parse_qs(query).get("uuid") or [""])[0]
+            if not _reveal_allowed(uuid, allowed):
+                self.send_error(403, "unknown uuid")
+                return
+            script = ('tell application "Photos"\n  activate\n'
+                      f'  spotlight media item id "{_norm_uuid(uuid)}"\n'
+                      "end tell")
+            proc = subprocess.run(["osascript", "-e", script],
+                                  capture_output=True, text=True, timeout=15)
+            if proc.returncode == 0:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok": true}')
+            else:
+                self.send_error(502, proc.stderr.strip()[:200] or "osascript failed")
+
+    handler = partial(Handler, directory=str(report_dir))
+    with http.server.ThreadingHTTPServer(("127.0.0.1", port), handler) as httpd:
+        url = f"http://127.0.0.1:{port}/index.html"
+        print(f"Serving the review at {url} -- Ctrl-C to stop.")
+        print("The per-member Photos buttons and the 'o' key reveal assets "
+              "in Photos.app.")
+        if open_browser:
+            subprocess.run(["open", url], check=False)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nStopped.")
+    return 0
+
+
 def cmd_review(args: argparse.Namespace) -> int:
     out_dir = Path(args.out)
     plan_path = out_dir / "plan.json"
@@ -1095,9 +1170,15 @@ def cmd_review(args: argparse.Namespace) -> int:
     print(f"Wrote {index} ({len(plan['tranches']):,} tranche(s)"
           + (f", {missing:,} thumbnail(s) unavailable" if missing else "") + ")")
     print("Open it, review, then use 'Export decisions' -- the downloaded "
-          "decisions.json is the input to the future apply stage.")
+          "decisions.json is what apply executes.")
+    serve_port = getattr(args, "serve", None)
+    if serve_port is not None:
+        allowed = {u for t in plan["tranches"] for u in t["members"]}
+        return serve_report(report_dir, serve_port, allowed, args.open)
     if args.open:
         subprocess.run(["open", str(index)], check=False)
+        print("(opened as file:// -- run with --serve to enable the "
+              "reveal-in-Photos buttons)")
     return 0
 
 
@@ -1148,6 +1229,18 @@ main { padding: 12px 16px 80px; max-width: 1300px; margin: 0 auto; }
 .actions { margin-top: 8px; display: flex; gap: 8px; align-items: center; }
 .spacer { flex: 1; }
 footer.load { text-align: center; padding: 16px; }
+.card.focused { outline: 2px solid #4a90d9; outline-offset: 1px; }
+.member { cursor: pointer; }
+.member:hover { border-color: color-mix(in srgb, CanvasText 45%, Canvas); }
+.member .reveal { font-size: 12px; margin-left: 10px; }
+#help { position: fixed; right: 16px; bottom: 16px; background: Canvas;
+        border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas);
+        border-radius: 10px; padding: 10px 14px; display: none; z-index: 3;
+        box-shadow: 0 6px 24px #0005; }
+#help.show { display: block; }
+#help td { padding: 1px 10px 1px 0; }
+kbd { font: 12px ui-monospace, monospace; padding: 0 5px; border-radius: 4px;
+      background: color-mix(in srgb, CanvasText 12%, Canvas); }
 </style>
 </head>
 <body>
@@ -1169,6 +1262,7 @@ footer.load { text-align: center; padding: 16px; }
   </select>
   <button id="approve-shown">Approve all shown</button>
   <button id="clear-shown">Clear shown</button>
+  <button id="helpbtn" title="keyboard shortcuts">?</button>
   <span class="spacer"></span>
   <button id="export">Export decisions</button>
   <label><input type="file" id="import" hidden>
@@ -1176,6 +1270,16 @@ footer.load { text-align: center; padding: 16px; }
   </label>
 </header>
 <main id="list"></main>
+<div id="help"><table>
+<tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>next / previous tranche</td></tr>
+<tr><td><kbd>g</kbd><kbd>g</kbd> / <kbd>G</kbd></td><td>first / last</td></tr>
+<tr><td><kbd>a</kbd> / <kbd>x</kbd></td><td>approve / reject, then advance</td></tr>
+<tr><td><kbd>u</kbd></td><td>clear decision</td></tr>
+<tr><td><kbd>n</kbd></td><td>next undecided</td></tr>
+<tr><td><kbd>h</kbd> / <kbd>l</kbd></td><td>cycle keeper</td></tr>
+<tr><td><kbd>o</kbd></td><td>reveal keeper in Photos.app</td></tr>
+<tr><td><kbd>?</kbd></td><td>toggle this help</td></tr>
+</table></div>
 <footer class="load"><button id="more" hidden>Show more</button></footer>
 <script id="data" type="application/json">__DATA__</script>
 <script>
@@ -1188,6 +1292,9 @@ try { dec = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
 const save = () => localStorage.setItem(KEY, JSON.stringify(dec));
 const PAGE = 100;
 let shown = PAGE;
+let focusIdx = 0;
+let lastKey = "";
+const REVEAL = location.protocol === "http:" || location.protocol === "https:";
 
 const state = k => (dec[k] && dec[k].d) || "undecided";
 const keeperOf = t => (dec[t.key] && dec[t.key].k) || t.keeper;
@@ -1197,6 +1304,37 @@ function matches(t, f) {
   if (f === "warnings") return t.warnings.length > 0;
   if (["undecided", "approved", "rejected"].includes(f)) return state(t.key) === f;
   return t.tier === f;
+}
+
+function visibleTranches() {
+  const f = document.getElementById("filter").value;
+  return DATA.tranches.filter(t => matches(t, f));
+}
+
+function setKeeper(t, uuid) {
+  if (keeperOf(t) === uuid) return;
+  dec[t.key] = dec[t.key] || {};
+  dec[t.key].k = uuid;
+  save(); render();
+}
+
+function decide(key, d, advance) {
+  dec[key] = dec[key] || {};
+  if (d === null || (dec[key].d === d && !advance)) delete dec[key].d;
+  else dec[key].d = d;
+  if (!Object.keys(dec[key]).length) delete dec[key];
+  save();
+  const t = DATA.tranches.find(x => x.key === key);
+  const f = document.getElementById("filter").value;
+  if (advance && matches(t, f)) focusTo(focusIdx + 1);
+  else render();
+}
+
+function reveal(uuid) {
+  if (!REVEAL) return;
+  fetch("/reveal?uuid=" + encodeURIComponent(uuid))
+    .then(r => { if (!r.ok) throw 0; })
+    .catch(() => alert("reveal failed -- is the review server still running?"));
 }
 
 function el(tag, cls, text) {
@@ -1257,10 +1395,16 @@ function memberCard(t, uuid) {
   const radio = document.createElement("input");
   radio.type = "radio"; radio.name = "k-" + t.key;
   radio.checked = keeperOf(t) === uuid;
-  radio.onchange = () => { dec[t.key] = dec[t.key] || {}; dec[t.key].k = uuid;
-                           save(); render(); };
+  radio.onchange = () => setKeeper(t, uuid);
   pick.prepend(radio);
   card.appendChild(pick);
+  if (REVEAL) {
+    const btn = el("button", "reveal", "Photos");
+    btn.title = "Reveal in Photos.app";
+    btn.onclick = ev => { ev.stopPropagation(); reveal(uuid); };
+    card.appendChild(btn);
+  }
+  card.onclick = () => setKeeper(t, uuid);  // the whole card picks the keeper
   return card;
 }
 
@@ -1290,11 +1434,7 @@ function trancheCard(t) {
   const actions = el("div", "actions");
   const mk = (label, d) => {
     const b = el("button", "", label);
-    b.onclick = () => { dec[t.key] = dec[t.key] || {};
-      dec[t.key].d = state(t.key) === d ? undefined : d;
-      if (!dec[t.key].d) delete dec[t.key].d;
-      if (!Object.keys(dec[t.key]).length) delete dec[t.key];
-      save(); render(); };
+    b.onclick = () => decide(t.key, d, false);
     return b;
   };
   actions.appendChild(mk("Approve", "approved"));
@@ -1315,18 +1455,78 @@ function counts() {
     r + " rejected · " + (DATA.tranches.length - a - r) + " undecided";
 }
 
-function render() {
-  const f = document.getElementById("filter").value;
-  const list = document.getElementById("list");
-  list.textContent = "";
-  const vis = DATA.tranches.filter(t => matches(t, f));
-  vis.slice(0, shown).forEach(t => list.appendChild(trancheCard(t)));
-  document.getElementById("more").hidden = vis.length <= shown;
-  counts();
+function focusTo(i) {
+  const vis = visibleTranches();
+  if (!vis.length) { focusIdx = 0; render(); return; }
+  focusIdx = Math.max(0, Math.min(i, vis.length - 1));
+  if (focusIdx >= shown) shown = Math.ceil((focusIdx + 1) / PAGE) * PAGE;
+  render();
 }
 
-document.getElementById("filter").onchange = () => { shown = PAGE; render(); };
+function nextUndecided() {
+  const vis = visibleTranches();
+  for (let s = 1; s <= vis.length; s++) {
+    const i = (focusIdx + s) % vis.length;
+    if (state(vis[i].key) === "undecided") { focusTo(i); return; }
+  }
+}
+
+function moveKeeper(t, delta) {
+  const i = t.members.indexOf(keeperOf(t));
+  setKeeper(t, t.members[(i + delta + t.members.length) % t.members.length]);
+}
+
+function toggleHelp() { document.getElementById("help").classList.toggle("show"); }
+
+function render() {
+  const list = document.getElementById("list");
+  list.textContent = "";
+  const vis = visibleTranches();
+  if (focusIdx >= vis.length) focusIdx = Math.max(0, vis.length - 1);
+  vis.slice(0, shown).forEach((t, i) => {
+    const card = trancheCard(t);
+    if (i === focusIdx) card.classList.add("focused");
+    list.appendChild(card);
+  });
+  document.getElementById("more").hidden = vis.length <= shown;
+  counts();
+  const focused = list.children[focusIdx];
+  if (focused) focused.scrollIntoView({ block: "nearest" });
+}
+
+document.addEventListener("keydown", ev => {
+  if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  const tag = ev.target && ev.target.tagName;
+  if (tag === "SELECT" || tag === "TEXTAREA"
+      || (tag === "INPUT" && ev.target.type !== "radio")) return;
+  const vis = visibleTranches();
+  const cur = vis[focusIdx];
+  let handled = true;
+  switch (ev.key) {
+    case "j": focusTo(focusIdx + 1); break;
+    case "k": focusTo(focusIdx - 1); break;
+    case "G": focusTo(vis.length - 1); break;
+    case "g": if (lastKey === "g") focusTo(0); break;
+    case "a": if (cur) decide(cur.key, "approved", true); break;
+    case "x": if (cur) decide(cur.key, "rejected", true); break;
+    case "u": if (cur) decide(cur.key, null, false); break;
+    case "n": nextUndecided(); break;
+    case "h": if (cur) moveKeeper(cur, -1); break;
+    case "l": if (cur) moveKeeper(cur, 1); break;
+    case "o": if (cur) reveal(keeperOf(cur)); break;
+    case "?": toggleHelp(); break;
+    case "Escape": document.getElementById("help").classList.remove("show"); break;
+    default: handled = false;
+  }
+  lastKey = ev.key;
+  if (handled) ev.preventDefault();
+});
+
+document.getElementById("filter").onchange = () => {
+  shown = PAGE; focusIdx = 0; render();
+};
 document.getElementById("more").onclick = () => { shown += PAGE; render(); };
+document.getElementById("helpbtn").onclick = toggleHelp;
 document.getElementById("approve-shown").onclick = () => {
   const f = document.getElementById("filter").value;
   DATA.tranches.filter(t => matches(t, f)).forEach(t => {
@@ -1813,6 +2013,10 @@ def add_review_args(p: argparse.ArgumentParser) -> None:
                    help=f"thumbnail long edge in px (default {DEFAULT_THUMB_PX})")
     p.add_argument("--skip-thumbs", action="store_true",
                    help="reuse existing thumbnails only")
+    p.add_argument("--serve", nargs="?", const=8942, type=int, default=None,
+                   metavar="PORT",
+                   help="serve the report on 127.0.0.1 (default port 8942) "
+                   "with reveal-in-Photos buttons; Ctrl-C to stop")
 
 
 def add_decisions_args(p: argparse.ArgumentParser) -> None:
@@ -1875,6 +2079,8 @@ examples:
     p_all.add_argument("--open", action="store_true")
     p_all.add_argument("--thumb-size", type=int, default=DEFAULT_THUMB_PX)
     p_all.add_argument("--skip-thumbs", action="store_true")
+    p_all.add_argument("--serve", nargs="?", const=8942, type=int, default=None,
+                       metavar="PORT")
     return parser
 
 
@@ -1968,13 +2174,27 @@ def selftest() -> None:
     assert format_rank("DNG") < format_rank("heic") < format_rank("png") \
         < format_rank("jpg") < format_rank("mov") < format_rank("xyz")
 
-    # merged date: oldest plausible across members and EXIF
+    # merged date: oldest plausible across members and EXIF. A lone EXIF
+    # date disagreeing with re-imported Photos dates is the NORMAL case the
+    # merge fixes -- no spread warning for it.
     m1 = _member("U1", "a.jpg", photos_date="2019-06-02T14:11:03",
                  exif={"DateTimeOriginal": "2016-08-19T09:12:44"})
     m2 = _member("U2", "b.jpg", photos_date="2019-06-02T14:11:03")
     dt, src, spread, warns = merged_date([m1, m2], 1990, now, 2.0)
     assert dt == "2016-08-19T09:12:44" and src == "exif-dto:a.jpg"
-    assert spread > 1000 and any(w.startswith("date-spread") for w in warns)
+    assert spread == 0.0 and warns == []
+
+    # ...but capture metadata disagreeing with capture metadata warns
+    m2x = _member("U2", "b.jpg", photos_date="2019-06-02T14:11:03",
+                  exif={"DateTimeOriginal": "2019-01-01T00:00:00"})
+    dt, src, spread, warns = merged_date([m1, m2x], 1990, now, 2.0)
+    assert dt == "2016-08-19T09:12:44"
+    assert spread > 800 and any(w.startswith("date-spread") for w in warns)
+    # within one member too (DateTimeOriginal vs CreateDate mismatch)
+    m_both = _member("U9", "c.jpg", exif={"DateTimeOriginal": "2016-08-19T09:12:44",
+                                          "CreateDate": "2019-01-01T00:00:00"})
+    _, _, spread, warns = merged_date([m_both], 1990, now, 2.0)
+    assert spread > 800 and any(w.startswith("date-spread") for w in warns)
 
     m3 = _member("U3", "c.jpg", photos_date="2019-06-02T14:11:04")
     dt, src, spread, warns = merged_date([m2, m3], 1990, now, 2.0)
@@ -2158,6 +2378,18 @@ def selftest() -> None:
     assert _dt_close("2020-01-01T00:00:00", "2020-01-01T00:00:02")
     assert not _dt_close("2020-01-01T00:00:00", "2020-01-01T00:00:03")
     assert _dt_close(None, None) and not _dt_close(None, "2020-01-01T00:00:00")
+
+    # reveal endpoint gatekeeping + template tripwires for the UI features
+    good = "0FBA8544-8AAC-4B24-8D75-A4956E5EFE9C"
+    assert _reveal_allowed(good, {good})
+    assert _reveal_allowed(good.lower() + "/l0/001", {good})  # AppleScript form
+    assert not _reveal_allowed(good, set())  # well-formed but not in the plan
+    assert not _reveal_allowed('"; do shell script "x"; "', {good})
+    assert not _reveal_allowed("", {""})
+    assert not _reveal_allowed(None, {good})
+    for needle in ('case "j"', "/reveal?uuid=", "keydown", 'id="help"',
+                   "setKeeper", "focusTo", 'id="helpbtn"'):
+        assert needle in REPORT_TEMPLATE, needle
 
     # burst + mixed-media warnings
     scan2 = {

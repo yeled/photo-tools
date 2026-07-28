@@ -158,15 +158,26 @@ by resolution → file size → format (RAW > HEIC > PNG > JPEG) → UUID, never
 date, and the **merged date** is the oldest *plausible* timestamp found
 anywhere in the tranche (every member's Photos date plus its file's
 EXIF/QuickTime dates via exiftool; epoch placeholders, pre-1990 and future
-dates are excluded but shown). Same inputs, same answer, every time.
+dates are excluded but shown). Same inputs, same answer, every time. The
+`date-spread` warning fires only when **EXIF/QuickTime candidates disagree
+with each other** — duplicates re-imported on different days routinely carry
+different Photos dates, and silently fixing that is the tool's job, not a
+reason for scrutiny.
 
 `review` renders a static HTML gallery: members side by side with thumbnails,
 every date candidate (implausible ones struck through), czkawka verification
 tier per tranche (`exact` / `visual-0` / `near` / `video` / `partial` /
 `unverified` — the last two are Apple-only claims czkawka could not confirm,
-so look closely). Approve/reject per tranche or in bulk, pick a different
-keeper, then *Export decisions* — the downloaded `decisions.json` is what
-`apply` executes. scan/plan/review never modify the library.
+so look closely). Approve/reject per tranche or in bulk, click anywhere on a
+member card to make it the keeper, then *Export decisions* — the downloaded
+`decisions.json` is what `apply` executes. Vim-style keys throughout
+(`?` shows the map): `j`/`k`/`gg`/`G` navigate, `a`/`x` approve/reject and
+advance, `u` clears, `n` jumps to the next undecided, `h`/`l` cycle the
+keeper, `o` reveals the keeper in Photos.app. Reveal needs
+`review --serve` (127.0.0.1, default port 8942), which adds per-member
+*Photos* buttons backed by a `/reveal` endpoint (AppleScript `spotlight`,
+uuids validated against the plan). scan/plan/review never modify the
+library.
 
 ```sh
 make -C merge-helper                       # build the PhotoKit helper (once)
