@@ -1089,17 +1089,56 @@ def _reveal_allowed(uuid, allowed: Set[str]) -> bool:
     return bool(_UUID_RE.fullmatch(uuid)) and uuid in allowed
 
 
-def serve_report(report_dir: Path, port: int, allowed: Set[str],
-                 open_browser: bool) -> int:
-    """Serve the report on 127.0.0.1 so the page gains a /reveal endpoint:
+def _valid_decisions_payload(obj) -> bool:
+    return (isinstance(obj, dict) and obj.get("version") == 1
+            and isinstance(obj.get("decisions"), dict))
+
+
+def serve_report(out_dir: Path, report_dir: Path, port: int, allowed: Set[str],
+                 plan_key: str, open_browser: bool) -> int:
+    """Serve the report on 127.0.0.1 so the page gains two endpoints:
     GET /reveal?uuid=X spotlights that asset in Photos.app via AppleScript
-    (the same reveal `osxphotos show` does)."""
+    (the same reveal `osxphotos show` does), and POST /decisions saves the
+    review's decisions as a timestamped file next to plan.json, refreshing
+    the stable decisions.json that apply reads."""
     import http.server
     from functools import partial
 
     class Handler(http.server.SimpleHTTPRequestHandler):
         def log_message(self, *log_args):  # keep the terminal quiet
             pass
+
+        def do_POST(self):
+            if self.path != "/decisions":
+                self.send_error(404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if not 0 < length <= 10_000_000:
+                self.send_error(400, "bad content length")
+                return
+            try:
+                obj = json.loads(self.rfile.read(length))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self.send_error(400, "not JSON")
+                return
+            if not _valid_decisions_payload(obj):
+                self.send_error(400, "not a decisions payload")
+                return
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            body = json.dumps(obj, indent=1, sort_keys=True)
+            stamped = out_dir / f"decisions-{stamp}.json"
+            stamped.write_text(body)
+            (out_dir / "decisions.json").write_text(body)
+            print(f"decisions saved: {stamped} (and refreshed decisions.json)")
+            resp = json.dumps({"ok": True, "path": str(stamped),
+                               "plan_key_match": obj.get("plan_key") == plan_key})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(resp.encode())
 
         def do_GET(self):
             if not self.path.startswith("/reveal"):
@@ -1174,7 +1213,8 @@ def cmd_review(args: argparse.Namespace) -> int:
     serve_port = getattr(args, "serve", None)
     if serve_port is not None:
         allowed = {u for t in plan["tranches"] for u in t["members"]}
-        return serve_report(report_dir, serve_port, allowed, args.open)
+        return serve_report(out_dir, report_dir, serve_port, allowed,
+                            plan["plan_key"], args.open)
     if args.open:
         subprocess.run(["open", str(index)], check=False)
         print("(opened as file:// -- run with --serve to enable the "
@@ -1239,6 +1279,7 @@ footer.load { text-align: center; padding: 16px; }
         box-shadow: 0 6px 24px #0005; }
 #help.show { display: block; }
 #help td { padding: 1px 10px 1px 0; }
+#status { font-size: 12px; opacity: .7; }
 kbd { font: 12px ui-monospace, monospace; padding: 0 5px; border-radius: 4px;
       background: color-mix(in srgb, CanvasText 12%, Canvas); }
 </style>
@@ -1263,6 +1304,7 @@ kbd { font: 12px ui-monospace, monospace; padding: 0 5px; border-radius: 4px;
   <button id="approve-shown">Approve all shown</button>
   <button id="clear-shown">Clear shown</button>
   <button id="helpbtn" title="keyboard shortcuts">?</button>
+  <span id="status"></span>
   <span class="spacer"></span>
   <button id="export">Export decisions</button>
   <label><input type="file" id="import" hidden>
@@ -1586,14 +1628,33 @@ document.getElementById("clear-shown").onclick = () => {
   [...document.getElementById("list").children].forEach(syncCard);
   counts();
 };
-document.getElementById("export").onclick = () => {
-  const out = { version: 1, plan_key: DATA.plan_key, decisions: dec };
+function flash(msg) {
+  const s = document.getElementById("status");
+  s.textContent = msg;
+  clearTimeout(flash.t);
+  flash.t = setTimeout(() => { s.textContent = ""; }, 6000);
+}
+
+function downloadDecisions(out) {
   const blob = new Blob([JSON.stringify(out, null, 1)],
                         { type: "application/json" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "decisions.json";
   a.click();
+}
+
+document.getElementById("export").onclick = () => {
+  const out = { version: 1, plan_key: DATA.plan_key, decisions: dec };
+  if (!REVEAL) { downloadDecisions(out); return; }
+  fetch("/decisions", { method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(out) })
+    .then(r => { if (!r.ok) throw 0; return r.json(); })
+    .then(res => flash("saved " + res.path
+                       + (res.plan_key_match === false ? "  (PLAN MISMATCH!)" : "")))
+    .catch(() => { flash("server save failed -- downloaded instead");
+                   downloadDecisions(out); });
 };
 document.getElementById("import").onchange = ev => {
   const file = ev.target.files[0];
@@ -2434,8 +2495,15 @@ def selftest() -> None:
     assert not _reveal_allowed("", {""})
     assert not _reveal_allowed(None, {good})
     for needle in ('case "j"', "/reveal?uuid=", "keydown", 'id="help"',
-                   "setKeeper", "focusTo", 'id="helpbtn"'):
+                   "setKeeper", "focusTo", 'id="helpbtn"', "/decisions",
+                   'id="status"', "downloadDecisions"):
         assert needle in REPORT_TEMPLATE, needle
+    assert _valid_decisions_payload({"version": 1, "decisions": {}})
+    assert not _valid_decisions_payload({"version": 2, "decisions": {}})
+    assert not _valid_decisions_payload({"version": 1, "decisions": []})
+    assert not _valid_decisions_payload({"version": 1})
+    assert not _valid_decisions_payload([])
+    assert not _valid_decisions_payload(None)
 
     # burst + mixed-media warnings
     scan2 = {

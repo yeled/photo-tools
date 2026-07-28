@@ -176,8 +176,10 @@ advance, `u` clears, `n` jumps to the next undecided, `h`/`l` cycle the
 keeper, `o` reveals the keeper in Photos.app. Reveal needs
 `review --serve` (127.0.0.1, default port 8942), which adds per-member
 *Photos* buttons backed by a `/reveal` endpoint (AppleScript `spotlight`,
-uuids validated against the plan). scan/plan/review never modify the
-library.
+uuids validated against the plan). In server mode *Export decisions* saves
+straight into the out dir as `decisions-YYYYMMDD-HHMMSS.json` and refreshes
+a stable `decisions.json` (opened as `file://` it downloads instead).
+scan/plan/review never modify the library.
 
 ```sh
 make -C merge-helper                       # build the PhotoKit helper (once)
