@@ -1291,7 +1291,8 @@ let dec = {};
 try { dec = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
 const save = () => localStorage.setItem(KEY, JSON.stringify(dec));
 const PAGE = 100;
-let shown = PAGE;
+let view = [];      // filtered tranches, 1:1 with the cards in the DOM
+let rendered = 0;   // how many of them have cards so far
 let focusIdx = 0;
 let lastKey = "";
 const REVEAL = location.protocol === "http:" || location.protocol === "https:";
@@ -1311,11 +1312,28 @@ function visibleTranches() {
   return DATA.tranches.filter(t => matches(t, f));
 }
 
+// Decisions and keeper changes touch ONLY the affected card -- never a full
+// re-render, so nothing flickers. Cards that stop matching the filter stay
+// put until the next rebuild (filter change / import); that is deliberate,
+// it keeps the triage flow visually stable.
 function setKeeper(t, uuid) {
   if (keeperOf(t) === uuid) return;
   dec[t.key] = dec[t.key] || {};
   dec[t.key].k = uuid;
-  save(); render();
+  save();
+  const card = document.querySelector('.card[data-key="' + t.key + '"]');
+  if (card) card.querySelectorAll(".member").forEach(m => {
+    const mine = m.dataset.uuid === uuid;
+    m.classList.toggle("keeper", mine);
+    const radio = m.querySelector("input[type=radio]");
+    if (radio) radio.checked = mine;
+  });
+}
+
+function syncCard(card) {
+  const s = state(card.dataset.key);
+  card.classList.toggle("approved", s === "approved");
+  card.classList.toggle("rejected", s === "rejected");
 }
 
 function decide(key, d, advance) {
@@ -1324,10 +1342,10 @@ function decide(key, d, advance) {
   else dec[key].d = d;
   if (!Object.keys(dec[key]).length) delete dec[key];
   save();
-  const t = DATA.tranches.find(x => x.key === key);
-  const f = document.getElementById("filter").value;
-  if (advance && matches(t, f)) focusTo(focusIdx + 1);
-  else render();
+  const card = document.querySelector('.card[data-key="' + key + '"]');
+  if (card) syncCard(card);
+  counts();
+  if (advance) focusTo(focusIdx + 1);
 }
 
 function reveal(uuid) {
@@ -1354,6 +1372,7 @@ function hsize(n) {
 function memberCard(t, uuid) {
   const m = DATA.members[uuid];
   const card = el("div", "member" + (keeperOf(t) === uuid ? " keeper" : ""));
+  card.dataset.uuid = uuid;
   if (THUMBS.has(uuid)) {
     const img = document.createElement("img");
     img.loading = "lazy";
@@ -1415,6 +1434,7 @@ function cleanExif(v) {
 
 function trancheCard(t) {
   const card = el("div", "card " + state(t.key));
+  card.dataset.key = t.key;
   const h = el("h3");
   h.appendChild(el("span", "", "#" + t.id));
   h.appendChild(el("span", "chip tier-" + t.tier,
@@ -1455,19 +1475,52 @@ function counts() {
     r + " rejected · " + (DATA.tranches.length - a - r) + " undecided";
 }
 
+function appendChunk() {
+  const list = document.getElementById("list");
+  view.slice(rendered, rendered + PAGE).forEach(t =>
+    list.appendChild(trancheCard(t)));
+  rendered = Math.min(rendered + PAGE, view.length);
+  document.getElementById("more").hidden = rendered >= view.length;
+}
+
+function ensureRendered(i) {
+  while (rendered <= i && rendered < view.length) appendChunk();
+}
+
+// Moving focus swaps one CSS class and scrolls -- the DOM stays untouched,
+// so thumbnails never reload and nothing flickers.
+function applyFocus(scroll) {
+  const list = document.getElementById("list");
+  const old = list.querySelector(".card.focused");
+  if (old) old.classList.remove("focused");
+  if (!view.length) return;
+  ensureRendered(focusIdx);
+  const card = list.children[focusIdx];
+  if (!card) return;
+  card.classList.add("focused");
+  if (scroll) {
+    // clear the sticky header, whatever height it wrapped to
+    card.style.scrollMarginTop =
+      (document.querySelector("header").offsetHeight + 10) + "px";
+    card.style.scrollMarginBottom = "12px";
+    card.scrollIntoView({ block: "nearest" });
+  }
+}
+
 function focusTo(i) {
-  const vis = visibleTranches();
-  if (!vis.length) { focusIdx = 0; render(); return; }
-  focusIdx = Math.max(0, Math.min(i, vis.length - 1));
-  if (focusIdx >= shown) shown = Math.ceil((focusIdx + 1) / PAGE) * PAGE;
-  render();
+  if (!view.length) return;
+  const clamped = Math.max(0, Math.min(i, view.length - 1));
+  if (clamped === focusIdx) return;  // j/k at the edges: a true no-op
+  focusIdx = clamped;
+  applyFocus(true);
 }
 
 function nextUndecided() {
-  const vis = visibleTranches();
-  for (let s = 1; s <= vis.length; s++) {
-    const i = (focusIdx + s) % vis.length;
-    if (state(vis[i].key) === "undecided") { focusTo(i); return; }
+  for (let s = 1; s <= view.length; s++) {
+    const i = (focusIdx + s) % view.length;
+    if (state(view[i].key) === "undecided") {
+      focusIdx = i; applyFocus(true); return;
+    }
   }
 }
 
@@ -1478,20 +1531,16 @@ function moveKeeper(t, delta) {
 
 function toggleHelp() { document.getElementById("help").classList.toggle("show"); }
 
-function render() {
-  const list = document.getElementById("list");
-  list.textContent = "";
-  const vis = visibleTranches();
-  if (focusIdx >= vis.length) focusIdx = Math.max(0, vis.length - 1);
-  vis.slice(0, shown).forEach((t, i) => {
-    const card = trancheCard(t);
-    if (i === focusIdx) card.classList.add("focused");
-    list.appendChild(card);
-  });
-  document.getElementById("more").hidden = vis.length <= shown;
+// Full rebuild only when the card SET changes: filter switch, import,
+// initial load. Everything else edits the standing DOM in place.
+function rebuild() {
+  view = visibleTranches();
+  rendered = 0;
+  document.getElementById("list").textContent = "";
+  appendChunk();
+  if (focusIdx >= view.length) focusIdx = Math.max(0, view.length - 1);
+  applyFocus(true);
   counts();
-  const focused = list.children[focusIdx];
-  if (focused) focused.scrollIntoView({ block: "nearest" });
 }
 
 document.addEventListener("keydown", ev => {
@@ -1499,13 +1548,12 @@ document.addEventListener("keydown", ev => {
   const tag = ev.target && ev.target.tagName;
   if (tag === "SELECT" || tag === "TEXTAREA"
       || (tag === "INPUT" && ev.target.type !== "radio")) return;
-  const vis = visibleTranches();
-  const cur = vis[focusIdx];
+  const cur = view[focusIdx];
   let handled = true;
   switch (ev.key) {
     case "j": focusTo(focusIdx + 1); break;
     case "k": focusTo(focusIdx - 1); break;
-    case "G": focusTo(vis.length - 1); break;
+    case "G": focusTo(view.length - 1); break;
     case "g": if (lastKey === "g") focusTo(0); break;
     case "a": if (cur) decide(cur.key, "approved", true); break;
     case "x": if (cur) decide(cur.key, "rejected", true); break;
@@ -1522,23 +1570,21 @@ document.addEventListener("keydown", ev => {
   if (handled) ev.preventDefault();
 });
 
-document.getElementById("filter").onchange = () => {
-  shown = PAGE; focusIdx = 0; render();
-};
-document.getElementById("more").onclick = () => { shown += PAGE; render(); };
+document.getElementById("filter").onchange = () => { focusIdx = 0; rebuild(); };
+document.getElementById("more").onclick = () => appendChunk();
 document.getElementById("helpbtn").onclick = toggleHelp;
 document.getElementById("approve-shown").onclick = () => {
-  const f = document.getElementById("filter").value;
-  DATA.tranches.filter(t => matches(t, f)).forEach(t => {
-    dec[t.key] = dec[t.key] || {}; dec[t.key].d = "approved"; });
-  save(); render();
+  view.forEach(t => { dec[t.key] = dec[t.key] || {}; dec[t.key].d = "approved"; });
+  save();
+  [...document.getElementById("list").children].forEach(syncCard);
+  counts();
 };
 document.getElementById("clear-shown").onclick = () => {
-  const f = document.getElementById("filter").value;
-  DATA.tranches.filter(t => matches(t, f)).forEach(t => {
-    if (dec[t.key]) { delete dec[t.key].d;
-      if (!Object.keys(dec[t.key]).length) delete dec[t.key]; } });
-  save(); render();
+  view.forEach(t => { if (dec[t.key]) { delete dec[t.key].d;
+    if (!Object.keys(dec[t.key]).length) delete dec[t.key]; } });
+  save();
+  [...document.getElementById("list").children].forEach(syncCard);
+  counts();
 };
 document.getElementById("export").onclick = () => {
   const out = { version: 1, plan_key: DATA.plan_key, decisions: dec };
@@ -1557,10 +1603,10 @@ document.getElementById("import").onchange = ev => {
     if (obj.plan_key !== DATA.plan_key &&
         !confirm("decisions.json is for a different plan; import anyway?")) return;
     Object.assign(dec, obj.decisions || {});
-    save(); render();
+    save(); rebuild();
   });
 };
-render();
+rebuild();
 </script>
 </body>
 </html>
