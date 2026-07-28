@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.yeled.merge-helper</string>
+	<key>CFBundleName</key>
+	<string>merge-helper</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Apply reviewed duplicate merges: set merged dates and favorites on keepers, move duplicates to Recently Deleted.</string>
+</dict>
+</plist>

@@ -190,10 +190,30 @@ every date candidate (implausible ones struck through), czkawka verification
 tier per tranche (`exact` / `visual-0` / `near` / `video` / `partial` /
 `unverified` — the last two are Apple-only claims czkawka could not confirm,
 so look closely). Approve/reject per tranche or in bulk, pick a different
-keeper, then *Export decisions* — the downloaded `decisions.json` plus
-`plan.json` are the inputs to the future apply stage (PhotoKit date writes +
-one batched delete; not built yet). Nothing in the library is modified by any
-of this.
+keeper, then *Export decisions* — the downloaded `decisions.json` is what
+`apply` executes. scan/plan/review never modify the library.
+
+```sh
+make -C merge-helper                       # build the PhotoKit helper (once)
+osxphotos run dedupe_photos.py apply --decisions ~/Downloads/decisions.json
+osxphotos run dedupe_photos.py apply --decisions ~/Downloads/decisions.json --apply
+osxphotos run dedupe_photos.py verify --decisions ~/Downloads/decisions.json
+```
+
+`apply` executes only approved tranches, dry-run by default, in a
+safety-ordered sequence: album/keyword/title transfer to the keeper via
+photoscript (Photos running; `--skip-photoscript` to forgo), then merged
+dates + favorites via `merge-helper` (PhotoKit `PHAssetChangeRequest` — the
+supported change API, so edits sync to iCloud like hand edits), then keeper
+dates are **re-verified against the live database**, and only then losers are
+deleted through **one** batched PhotoKit call — a single system confirmation
+dialog for the whole run, everything into Recently Deleted (30-day recovery).
+Every member is re-validated against the live library first; tranches whose
+members changed since the plan, or whose metadata transfer failed, are held
+back and retried next run. Each apply writes an `apply-log-*.json` undo
+record (old dates, deleted uuids; date changes are also revertible with
+`osxphotos timewarp --reset`). `verify` reports per-tranche completeness and
+exits nonzero while anything is pending.
 
 **WAL caveat:** the default scan reader loads the library via osxphotos,
 which copies `Photos.sqlite` *and its write-ahead log* to a temp dir. After a

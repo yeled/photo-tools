@@ -1,13 +1,28 @@
 """Merge Apple Photos duplicates deterministically, starting from Apple's own
 Duplicates analysis, verified by czkawka.
 
-Phase 1 (this tool, READ-ONLY): harvest Apple's duplicate groups straight from
+scan/plan/review (READ-ONLY): harvest Apple's duplicate groups straight from
 the Photos library database (the same groups the Duplicates album shows --
 `ZASSET.ZDUPLICATEPERCEPTUALMATCHINGALBUM` / `ZDUPLICATEMETADATAMATCHINGALBUM`
 carry the grouping itself, so nothing needs to be selected or exported),
 cross-check every group with czkawka's exact (BLAKE3) and perceptual hashes,
 compute a deterministic merge plan, and render an HTML review gallery. Nothing
-in the library is modified; the plan is the input to a later apply stage.
+in the library is modified by those stages.
+
+apply/verify: execute ONLY the tranches approved in the review page's
+decisions.json, in a safety-ordered sequence -- (1) album membership, keyword
+and title/description transfer to the keeper via photoscript (Photos must be
+running; --skip-photoscript to forgo), (2) merged dates and favorites on
+keepers via the merge-helper binary (PhotoKit `PHAssetChangeRequest`, the
+supported change API, so everything syncs to iCloud; build it once with
+`make -C merge-helper`), (3) keeper dates re-verified against the live
+database, and only then (4) losers deleted through ONE batched PhotoKit call:
+a single system confirmation dialog for the whole run, everything lands in
+Recently Deleted (30-day recovery). Tranches whose members changed since the
+plan, or whose metadata transfer failed, are held back automatically and
+retried on the next apply. Every apply writes an apply-log JSON (old dates,
+deleted uuids) as the undo record; `verify` reports per-tranche completeness
+afterwards. apply without --apply is a dry run.
 
 The merge plan fixes what Apple's own Merge button gets wrong:
 
@@ -25,6 +40,9 @@ Pipeline (each stage writes JSON the next one reads; rerun any stage):
     osxphotos run dedupe_photos.py plan     # scan.json -> plan.json (pure, offline)
     osxphotos run dedupe_photos.py review   # plan.json -> report/index.html
     osxphotos run dedupe_photos.py all      # the three in sequence
+    osxphotos run dedupe_photos.py apply --decisions decisions.json          # dry run
+    osxphotos run dedupe_photos.py apply --decisions decisions.json --apply  # write
+    osxphotos run dedupe_photos.py verify --decisions decisions.json         # check
 
 scan readers (--reader):
     osxphotos  (default) rich metadata: albums, keywords, Live/RAW/burst
@@ -654,6 +672,9 @@ def read_members_osxphotos(library: Optional[Path], uuids: Set[str],
             "favorite": bool(p.favorite),
             "flags": flags,
             "burst_key": getattr(p, "burst_key", None),
+            "album_uuids": sorted(
+                [[a.uuid, a.title] for a in (getattr(p, "album_info", None) or [])
+                 if getattr(a, "uuid", None)]),
             "albums": sorted(set(p.albums or [])),
             "keywords": sorted(set(p.keywords or [])),
             "title": p.title,
@@ -1347,6 +1368,400 @@ render();
 
 
 # --------------------------------------------------------------------------
+# apply / verify: consume plan.json + decisions.json (phase 2)
+# --------------------------------------------------------------------------
+
+DATE_TOLERANCE_SECONDS = 2
+
+
+def _dt_close(a_iso: Optional[str], b_iso: Optional[str],
+              tol: int = DATE_TOLERANCE_SECONDS) -> bool:
+    a, b = parse_iso(a_iso), parse_iso(b_iso)
+    if a is None or b is None:
+        return a is b
+    return abs((a - b).total_seconds()) <= tol
+
+
+def load_decisions(path: Path, plan: dict, force_plan_key: bool) -> Dict[str, dict]:
+    obj = json.loads(path.read_text())
+    if obj.get("version") != 1:
+        raise SystemExit(f"{path}: unsupported decisions version {obj.get('version')!r}")
+    if obj.get("plan_key") != plan.get("plan_key") and not force_plan_key:
+        raise SystemExit(
+            f"{path} was exported for plan {obj.get('plan_key')!r} but this is "
+            f"plan {plan.get('plan_key')!r} -- the plan changed since review. "
+            "Re-review, or pass --force-plan-key if you know they match.")
+    return obj.get("decisions") or {}
+
+
+def approved_tranches(plan: dict, decisions: Dict[str, dict]
+                      ) -> List[Tuple[dict, str]]:
+    """(tranche, effective keeper) for every approved tranche. A reviewer
+    keeper override must name a member; anything else means the decisions
+    file does not belong to this plan."""
+    out = []
+    for t in plan["tranches"]:
+        d = decisions.get(t["key"]) or {}
+        if d.get("d") != "approved":
+            continue
+        keeper = d.get("k") or t["keeper"]
+        if keeper not in t["members"]:
+            raise SystemExit(
+                f"decisions.json picks keeper {keeper} for tranche {t['key']}, "
+                "which is not a member of that tranche -- wrong decisions file?")
+        out.append((t, keeper))
+    return out
+
+
+def read_live_rows(conn: sqlite3.Connection, uuids: Iterable[str]
+                   ) -> Dict[str, dict]:
+    """Current state of these assets straight from the live database:
+    existence, trash state, date, favorite. The ground truth apply trusts
+    over anything recorded at scan time."""
+    rows: Dict[str, dict] = {}
+    todo = sorted(set(uuids))
+    for i in range(0, len(todo), 800):
+        chunk = todo[i:i + 800]
+        marks = ",".join("?" * len(chunk))
+        for r in conn.execute(
+                f"SELECT ZUUID, ZDATECREATED, ZFAVORITE, ZTRASHEDSTATE "
+                f"FROM ZASSET WHERE ZUUID IN ({marks})", chunk):
+            rows[_norm_uuid(r["ZUUID"])] = {
+                "exists": True,
+                "trashed": bool(r["ZTRASHEDSTATE"]),
+                "date": iso(core_data_to_local(r["ZDATECREATED"])),
+                "favorite": bool(r["ZFAVORITE"]),
+            }
+    for uuid in todo:
+        rows.setdefault(uuid, {"exists": False, "trashed": False,
+                               "date": None, "favorite": False})
+    return rows
+
+
+def build_apply_worklist(plan: dict, decisions: Dict[str, dict],
+                         live: Dict[str, dict],
+                         skip_photoscript: bool = False) -> dict:
+    """Everything --apply would do, computed up front and deterministically.
+
+    Per approved tranche: a date write when the keeper's live date differs
+    from the merged date by more than the tolerance; a favorite when any
+    member is favorited but the keeper is not; album adds / keyword union /
+    title+description fill (photoscript work, needs the rich scan); and the
+    losers to delete. Tranches with unmergeable members or members that
+    vanished since the plan are skipped with a reason."""
+    members_all: Dict[str, dict] = plan["members"]
+    work = {"tranches": [], "dates": [], "favorites": [], "albums": [],
+            "keywords": [], "texts": [], "deletes": [], "skipped": []}
+
+    for t, keeper in approved_tranches(plan, decisions):
+        key = t["key"]
+        if any(w.startswith("unmergeable-member") for w in t["warnings"]):
+            work["skipped"].append({"key": key, "reason": "unmergeable-member"})
+            continue
+        gone = [u for u in t["members"]
+                if not live[u]["exists"] or live[u]["trashed"]]
+        if gone:
+            work["skipped"].append({"key": key,
+                                    "reason": f"member-gone:{','.join(gone)}"})
+            continue
+
+        losers = [u for u in t["members"] if u != keeper]
+        rec = {"key": key, "id": t["id"], "keeper": keeper, "losers": losers}
+
+        if t["merged_date"] and not _dt_close(live[keeper]["date"], t["merged_date"]):
+            work["dates"].append({"tranche": key, "uuid": keeper,
+                                  "date": t["merged_date"],
+                                  "old_date": live[keeper]["date"]})
+        if any(live[u]["favorite"] for u in t["members"]) \
+                and not live[keeper]["favorite"]:
+            work["favorites"].append({"tranche": key, "uuid": keeper})
+
+        if not skip_photoscript:
+            keeper_m = members_all[keeper]
+            keeper_albums = {a[0] for a in keeper_m.get("album_uuids") or []}
+            adds = {}
+            for u in losers:
+                for auuid, title in members_all[u].get("album_uuids") or []:
+                    if auuid not in keeper_albums:
+                        adds[auuid] = title
+            for auuid in sorted(adds):
+                work["albums"].append({"tranche": key, "album_uuid": auuid,
+                                       "album_title": adds[auuid],
+                                       "uuid": keeper})
+            union = sorted(set().union(
+                *(members_all[u].get("keywords") or [] for u in t["members"])))
+            if union and set(union) != set(keeper_m.get("keywords") or []):
+                work["keywords"].append({"tranche": key, "uuid": keeper,
+                                         "keywords": union})
+            texts = {}
+            for field_name in ("title", "description"):
+                if keeper_m.get(field_name):
+                    continue
+                donors = [members_all[u].get(field_name)
+                          for u in [keeper] + losers
+                          if members_all[u].get(field_name)]
+                if donors:
+                    texts[field_name] = donors[0]
+            if texts:
+                work["texts"].append({"tranche": key, "uuid": keeper, **texts})
+
+        work["deletes"].extend({"tranche": key, "uuid": u} for u in losers)
+        work["tranches"].append(rec)
+
+    for lst in ("dates", "favorites", "albums", "keywords", "texts", "deletes"):
+        work[lst].sort(key=lambda e: (e["tranche"], e.get("uuid", ""),
+                                      e.get("album_uuid", "")))
+    work["skipped"].sort(key=lambda e: e["key"])
+    return work
+
+
+def verify_tranche(t: dict, keeper: str, live: Dict[str, dict]) -> str:
+    if not live[keeper]["exists"] or live[keeper]["trashed"]:
+        return "keeper-missing"
+    date_ok = (not t["merged_date"]
+               or _dt_close(live[keeper]["date"], t["merged_date"]))
+    losers = [u for u in t["members"] if u != keeper]
+    losers_gone = all(not live[u]["exists"] or live[u]["trashed"] for u in losers)
+    if date_ok and losers_gone:
+        return "complete"
+    if date_ok:
+        return "losers-pending"
+    if losers_gone:
+        return "date-pending"
+    return "pending"
+
+
+def default_helper_path() -> Path:
+    return Path(__file__).resolve().parent / "merge-helper" / "merge-helper"
+
+
+def run_helper(helper: Path, manifest: Path, apply_writes: bool,
+               verbose: Callable) -> int:
+    cmd = [str(helper), "--manifest", str(manifest)]
+    if apply_writes:
+        cmd.append("--apply")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    for line in (proc.stdout or "").splitlines():
+        verbose(f"  {line}")
+    if proc.stderr:
+        verbose(f"  {proc.stderr.strip()}")
+    return proc.returncode
+
+
+def apply_photoscript(work: dict, verbose: Callable) -> Set[str]:
+    """Album adds, keyword unions, title/description fills via photoscript
+    (AppleScript; Photos must be running). Returns the tranche keys that had
+    failures -- their losers are held back from deletion this run, so the
+    context they carry is never lost."""
+    import photoscript
+
+    failed: Set[str] = set()
+    by_album: Dict[str, List[dict]] = {}
+    for entry in work["albums"]:
+        by_album.setdefault(entry["album_uuid"], []).append(entry)
+    for auuid, entries in sorted(by_album.items()):
+        title = entries[0]["album_title"]
+        try:
+            album = photoscript.Album(auuid)
+            album.add([photoscript.Photo(e["uuid"]) for e in entries])
+            verbose(f"  album '{title}': added {len(entries)} keeper(s)")
+        except Exception as err:
+            verbose(f"  album '{title}' ({auuid}): FAILED ({err})")
+            failed.update(e["tranche"] for e in entries)
+    for entry in work["keywords"]:
+        try:
+            photoscript.Photo(entry["uuid"]).keywords = entry["keywords"]
+            verbose(f"  keywords -> {entry['uuid']}: {', '.join(entry['keywords'])}")
+        except Exception as err:
+            verbose(f"  keywords -> {entry['uuid']}: FAILED ({err})")
+            failed.add(entry["tranche"])
+    for entry in work["texts"]:
+        try:
+            photo = photoscript.Photo(entry["uuid"])
+            if entry.get("title"):
+                photo.title = entry["title"]
+            if entry.get("description"):
+                photo.description = entry["description"]
+            verbose(f"  title/description -> {entry['uuid']}")
+        except Exception as err:
+            verbose(f"  title/description -> {entry['uuid']}: FAILED ({err})")
+            failed.add(entry["tranche"])
+    return failed
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    out_dir = Path(args.out)
+    plan_path = out_dir / "plan.json"
+    if not plan_path.exists():
+        raise SystemExit(f"{plan_path} not found -- run plan first")
+    plan = json.loads(plan_path.read_text())
+    decisions = load_decisions(Path(args.decisions), plan, args.force_plan_key)
+
+    library = Path(args.library) if args.library else Path(plan["library"])
+    conn = sqlite_ro(library / "database" / "Photos.sqlite")
+    try:
+        wanted = {u for t, _ in approved_tranches(plan, decisions)
+                  for u in t["members"]}
+        if not wanted:
+            print("No approved tranches in the decisions file; nothing to do.")
+            return 0
+        live = read_live_rows(conn, wanted)
+        gen = library_generation(conn, 0)
+    finally:
+        conn.close()
+
+    if gen["asset_count"] != plan["generation"]["asset_count"]:
+        print(f"note: library has {gen['asset_count']:,} assets now vs "
+              f"{plan['generation']['asset_count']:,} at scan time; every "
+              "member is re-validated against the live database below.")
+
+    work = build_apply_worklist(plan, decisions, live,
+                                skip_photoscript=args.skip_photoscript)
+
+    n_tr = len(work["tranches"])
+    print(f"\nApply worklist: {n_tr:,} tranche(s) "
+          f"({len(work['skipped'])} skipped)")
+    print(f"  dates to set     : {len(work['dates']):,}")
+    print(f"  favorites to set : {len(work['favorites']):,}")
+    print(f"  album adds       : {len(work['albums']):,}")
+    print(f"  keyword unions   : {len(work['keywords']):,}")
+    print(f"  title/desc fills : {len(work['texts']):,}")
+    print(f"  losers to delete : {len(work['deletes']):,}")
+    for s in work["skipped"][:20]:
+        print(f"  skipped {s['key']}: {s['reason']}")
+    if len(work["skipped"]) > 20:
+        print(f"  ... and {len(work['skipped']) - 20} more skipped")
+
+    meta_manifest = out_dir / "apply-metadata.json"
+    meta_manifest.write_text(json.dumps({
+        "dates": [{"uuid": e["uuid"], "date": e["date"]} for e in work["dates"]],
+        "favorites": [e["uuid"] for e in work["favorites"]],
+    }, indent=1, sort_keys=True))
+    del_manifest = out_dir / "apply-deletes.json"
+    del_manifest.write_text(json.dumps({
+        "deletes": [e["uuid"] for e in work["deletes"]],
+    }, indent=1, sort_keys=True))
+    print(f"\nManifests written: {meta_manifest}, {del_manifest}")
+
+    if not args.apply:
+        print("\nDry run only -- nothing written to the library. Re-run with "
+              "--apply to execute: photoscript merges (Photos must be open "
+              "unless --skip-photoscript), then dates/favorites via "
+              "merge-helper, then ONE batched delete (one system dialog; "
+              "everything goes to Recently Deleted, recoverable for 30 days).")
+        return 0
+
+    helper = Path(args.helper) if args.helper else default_helper_path()
+    if (work["dates"] or work["favorites"] or work["deletes"]) \
+            and not helper.exists():
+        raise SystemExit(f"{helper} not built -- run: make -C {helper.parent}")
+
+    log: dict = {"decisions": str(args.decisions), "worklist": work,
+                 "photoscript_failed_tranches": [], "date_mismatches": [],
+                 "helper_metadata_rc": None, "helper_deletes_rc": None,
+                 "deletes_cancelled": False}
+    held_back: Set[str] = set()
+
+    if not args.skip_photoscript and (work["albums"] or work["keywords"]
+                                      or work["texts"]):
+        print("\nMerging albums/keywords/titles via photoscript "
+              "(Photos must be running)...")
+        try:
+            failed = apply_photoscript(work, print)
+        except Exception as err:
+            raise SystemExit(
+                f"photoscript merge failed outright ({err}) -- is Photos "
+                "running? Use --skip-photoscript to merge without album/"
+                "keyword transfer (that context is then not preserved).")
+        held_back |= failed
+        log["photoscript_failed_tranches"] = sorted(failed)
+
+    if work["dates"] or work["favorites"]:
+        print("\nWriting dates/favorites via merge-helper (PhotoKit)...")
+        rc = run_helper(helper, meta_manifest, True, print)
+        log["helper_metadata_rc"] = rc
+        if rc != 0:
+            print(f"merge-helper metadata pass exited {rc}; verifying what "
+                  "landed before considering deletes...")
+
+        print("\nVerifying keeper dates against the live database...")
+        import time
+        time.sleep(3)
+        conn = sqlite_ro(library / "database" / "Photos.sqlite")
+        try:
+            post = read_live_rows(conn, [e["uuid"] for e in work["dates"]])
+        finally:
+            conn.close()
+        for e in work["dates"]:
+            if not _dt_close(post[e["uuid"]]["date"], e["date"]):
+                held_back.add(e["tranche"])
+                log["date_mismatches"].append(e)
+                print(f"  MISMATCH {e['uuid']}: wanted {e['date']}, "
+                      f"library has {post[e['uuid']]['date']}")
+        if not log["date_mismatches"]:
+            print(f"  all {len(work['dates']):,} keeper date(s) verified")
+
+    deletes = [e for e in work["deletes"] if e["tranche"] not in held_back]
+    held_deletes = len(work["deletes"]) - len(deletes)
+    if held_deletes:
+        print(f"\nHolding back {held_deletes:,} delete(s) from "
+              f"{len(held_back)} tranche(s) with unverified merges -- "
+              "rerun apply once the cause is fixed; they are retried then.")
+    if args.skip_deletes:
+        print(f"\n--skip-deletes: leaving {len(deletes):,} loser(s) in place.")
+    elif deletes:
+        del_manifest.write_text(json.dumps(
+            {"deletes": [e["uuid"] for e in deletes]}, indent=1, sort_keys=True))
+        print(f"\nDeleting {len(deletes):,} loser(s) via merge-helper -- "
+              "answer the system confirmation dialog (one for the whole batch)...")
+        rc = run_helper(helper, del_manifest, True, print)
+        log["helper_deletes_rc"] = rc
+        if rc == 3:
+            log["deletes_cancelled"] = True
+            print("Delete dialog cancelled; keepers are merged, losers remain. "
+                  "Rerun apply to try the deletes again.")
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = out_dir / f"apply-log-{stamp}.json"
+    log_path.write_text(json.dumps(log, indent=1, sort_keys=True))
+    print(f"\nApply log (undo record: old dates, deleted uuids): {log_path}")
+    print("Deleted items sit in Recently Deleted for 30 days; date changes "
+          "are listed in the log and revertible with osxphotos timewarp --reset.")
+    print(f"Check the outcome with: osxphotos run {SCRIPT} verify "
+          f"--decisions {args.decisions} --out {out_dir}")
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    out_dir = Path(args.out)
+    plan = json.loads((out_dir / "plan.json").read_text())
+    decisions = load_decisions(Path(args.decisions), plan, args.force_plan_key)
+    approved = approved_tranches(plan, decisions)
+    if not approved:
+        print("No approved tranches in the decisions file.")
+        return 0
+    library = Path(args.library) if args.library else Path(plan["library"])
+    conn = sqlite_ro(library / "database" / "Photos.sqlite")
+    try:
+        live = read_live_rows(conn, {u for t, _ in approved for u in t["members"]})
+    finally:
+        conn.close()
+
+    states: Dict[str, List[str]] = {}
+    for t, keeper in approved:
+        states.setdefault(verify_tranche(t, keeper, live), []).append(t["key"])
+    print(f"Verify: {len(approved):,} approved tranche(s)")
+    for state in sorted(states):
+        print(f"  {state:<15} {len(states[state]):,}")
+    residual = [k for s, keys in states.items() if s != "complete" for k in keys]
+    for key in residual[:30]:
+        print(f"  incomplete: {key}")
+    if len(residual) > 30:
+        print(f"  ... and {len(residual) - 30} more")
+    return 0 if not residual else 1
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -1400,6 +1815,31 @@ def add_review_args(p: argparse.ArgumentParser) -> None:
                    help="reuse existing thumbnails only")
 
 
+def add_decisions_args(p: argparse.ArgumentParser) -> None:
+    add_out(p)
+    p.add_argument("--decisions", required=True, metavar="PATH",
+                   help="decisions.json exported from the review page")
+    p.add_argument("--library", metavar="PATH",
+                   help="Photos library (default: the one recorded in the plan)")
+    p.add_argument("--force-plan-key", action="store_true",
+                   help="accept a decisions file exported for a different plan")
+
+
+def add_apply_args(p: argparse.ArgumentParser) -> None:
+    add_decisions_args(p)
+    p.add_argument("--apply", action="store_true",
+                   help="actually write; without this only the worklist and "
+                   "manifests are produced")
+    p.add_argument("--skip-deletes", action="store_true",
+                   help="merge metadata but leave the losers in place")
+    p.add_argument("--skip-photoscript", action="store_true",
+                   help="skip album/keyword/title transfer (does not need "
+                   "Photos running, but that context is not preserved)")
+    p.add_argument("--helper", metavar="PATH",
+                   help="merge-helper binary (default: merge-helper/merge-helper "
+                   "next to this script)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=SCRIPT,
@@ -1422,6 +1862,10 @@ examples:
     add_scan_args(sub.add_parser("scan", help="read Apple groups + czkawka verify"))
     add_plan_args(sub.add_parser("plan", help="compute deterministic merge plan"))
     add_review_args(sub.add_parser("review", help="render the HTML review gallery"))
+    add_apply_args(sub.add_parser(
+        "apply", help="execute approved merges (dry-run without --apply)"))
+    add_decisions_args(sub.add_parser(
+        "verify", help="check approved tranches against the live library"))
     p_all = sub.add_parser("all", help="scan, plan, review in sequence")
     add_scan_args(p_all)
     p_all.add_argument("--min-plausible-year", type=int,
@@ -1450,6 +1894,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_plan(args)
     if args.command == "review":
         return cmd_review(args)
+    if args.command == "apply":
+        return cmd_apply(args)
+    if args.command == "verify":
+        return cmd_verify(args)
     if args.command == "all":
         rc = cmd_scan(args)
         if rc:
@@ -1630,6 +2078,86 @@ def selftest() -> None:
     assert "<img src=x onerror" not in html_text  # every "<" is <-escaped
     assert "\\u003cimg src=x onerror=alert(1)>.jpg" in html_text
     assert 'type="application/json"' in html_text
+
+    # apply worklist: decisions filtering, keeper override, live-state rules
+    plan_a = build_plan(scan, dg, ig, [], 1990, 2.0, now=now)
+    k12 = by_members[("U1", "U2")]["key"]
+    kh = by_members[("H1", "H2")]["key"]
+    live = {
+        "U1": {"exists": True, "trashed": False,
+               "date": "2019-06-02T14:11:03", "favorite": False},
+        "U2": {"exists": True, "trashed": False,
+               "date": "2019-06-02T14:11:04", "favorite": True},
+        "H1": {"exists": True, "trashed": False, "date": None, "favorite": False},
+        "H2": {"exists": True, "trashed": False, "date": None, "favorite": False},
+    }
+    plan_a["members"]["U2"]["album_uuids"] = [["AL-1", "Trip"]]
+    plan_a["members"]["U2"]["keywords"] = ["beach"]
+    plan_a["members"]["U2"]["title"] = "Sunset"
+    dec = {k12: {"d": "approved"}, kh: {"d": "approved"}}
+    work = build_apply_worklist(plan_a, dec, live)
+    assert [t["key"] for t in work["tranches"]] == [k12]
+    assert work["skipped"] == [{"key": kh, "reason": "unmergeable-member"}]
+    assert work["dates"] == []  # keeper U1 already at the merged date
+    assert [e["uuid"] for e in work["favorites"]] == ["U1"]  # U2 fav, U1 not
+    assert [e["album_uuid"] for e in work["albums"]] == ["AL-1"]
+    assert work["keywords"][0]["keywords"] == ["beach"]
+    assert work["texts"][0]["title"] == "Sunset"
+    assert [e["uuid"] for e in work["deletes"]] == ["U2"]
+
+    # keeper drifted by >2s -> date write with old date recorded
+    live2 = dict(live, U1={"exists": True, "trashed": False,
+                           "date": "2019-06-02T14:11:09", "favorite": False})
+    work2 = build_apply_worklist(plan_a, dec, live2)
+    assert work2["dates"] == [{"tranche": k12, "uuid": "U1",
+                               "date": "2019-06-02T14:11:03",
+                               "old_date": "2019-06-02T14:11:09"}]
+    # within tolerance -> no write
+    live3 = dict(live, U1={"exists": True, "trashed": False,
+                           "date": "2019-06-02T14:11:04", "favorite": False})
+    assert build_apply_worklist(plan_a, dec, live3)["dates"] == []
+    # a member vanished since the plan -> tranche skipped
+    live4 = dict(live, U2={"exists": False, "trashed": False,
+                           "date": None, "favorite": False})
+    work4 = build_apply_worklist(plan_a, dec, live4)
+    assert work4["tranches"] == []
+    assert any(s["key"] == k12 and "member-gone:U2" in s["reason"]
+               for s in work4["skipped"])
+    # keeper override via decisions; invalid override refuses
+    work5 = build_apply_worklist(plan_a, {k12: {"d": "approved", "k": "U2"}}, live)
+    assert work5["tranches"][0]["keeper"] == "U2"
+    assert [e["uuid"] for e in work5["deletes"]] == ["U1"]
+    try:
+        build_apply_worklist(plan_a, {k12: {"d": "approved", "k": "NOPE"}}, live)
+    except SystemExit as err:
+        assert "not a member" in str(err)
+    else:
+        raise AssertionError("expected SystemExit for foreign keeper override")
+    # rejected/undecided tranches are not selected at all
+    assert build_apply_worklist(plan_a, {k12: {"d": "rejected"}}, live)["tranches"] == []
+    assert build_apply_worklist(plan_a, {}, live)["tranches"] == []
+    # skip_photoscript drops album/keyword/text work but keeps deletes
+    work6 = build_apply_worklist(plan_a, dec, live, skip_photoscript=True)
+    assert work6["albums"] == [] and work6["keywords"] == [] and work6["texts"] == []
+    assert [e["uuid"] for e in work6["deletes"]] == ["U2"]
+
+    # verify states
+    t12_t = next(t for t, _ in approved_tranches(plan_a, dec) if t["key"] == k12)
+    assert verify_tranche(t12_t, "U1", live) == "losers-pending"
+    live_done = dict(live, U2={"exists": False, "trashed": False,
+                               "date": None, "favorite": False})
+    assert verify_tranche(t12_t, "U1", live_done) == "complete"
+    assert verify_tranche(t12_t, "U1", live2) == "pending"
+    live_del = dict(live2, U2={"exists": True, "trashed": True,
+                               "date": None, "favorite": False})
+    assert verify_tranche(t12_t, "U1", live_del) == "date-pending"
+    assert verify_tranche(t12_t, "U1",
+                          dict(live, U1={"exists": False, "trashed": False,
+                                         "date": None, "favorite": False})
+                          ) == "keeper-missing"
+    assert _dt_close("2020-01-01T00:00:00", "2020-01-01T00:00:02")
+    assert not _dt_close("2020-01-01T00:00:00", "2020-01-01T00:00:03")
+    assert _dt_close(None, None) and not _dt_close(None, "2020-01-01T00:00:00")
 
     # burst + mixed-media warnings
     scan2 = {

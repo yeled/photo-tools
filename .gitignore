@@ -2,4 +2,5 @@ __pycache__/
 *.py[cod]
 .DS_Store
 flatten-photos/flatten-photos
+merge-helper/merge-helper
 dedupe-out/
