@@ -98,6 +98,9 @@ timewarp walks the photos does not matter -- but don't change the selection
 while it runs. Loading the library database takes a moment for very large
 libraries; after that the plan is instant.
 
+A bare run dry-runs against the current selection (see DIRECT APPLY MODE
+above); --help prints CLI usage; --selftest runs the offline self-tests (safe
+on any machine; does not touch Photos).
 """
 
 from __future__ import annotations
