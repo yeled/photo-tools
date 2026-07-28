@@ -58,7 +58,18 @@ scan readers (--reader):
 czkawka verification (needs `czkawka_cli` on PATH; Homebrew build decodes
 HEIC): originals are HARDLINKED into <out>/farm/ (no data copied) and czkawka
 runs its `dup` (byte-identical), `image` (perceptual distance) and `video`
-tools over the farm. Each tranche is annotated with a verification tier:
+tools over the farm. By default the farm holds only Apple's group members
+and czkawka merely VERIFIES Apple's claims. `scan --discover` instead farms
+EVERY local, mergeable original and feeds czkawka's groups into the same
+union-find as Apple's: copies Apple missed attach to their Apple tranches
+(3-, 4-, N-member tranches), czkawka links merge Apple groups that are
+really one photo, and czkawka-only tranches appear with their own source
+chip. czkawka-only groups made entirely of one burst are dropped (burst
+siblings, not duplicates; --include-bursts keeps them). Assets without a
+local original are invisible to discovery -- scan reports how many. The
+first discovery sweep perceptually hashes the whole library (hours; cached
+and incremental afterwards). Each tranche is annotated with a verification
+tier:
 
     exact       every member byte-identical (dup)
     visual-0    perceptual distance 0 and identical dimensions
@@ -86,7 +97,9 @@ method is never enabled), thumbnails are written under --out only.
 Options (see each subcommand's --help):
     --out DIR                working directory (default: dedupe-out)
     --library PATH           Photos library (default: last-opened / ~/Pictures)
-    --limit N                scan only the first N Apple groups (smoke tests)
+    --discover               sweep ALL local originals, not just Apple's groups
+    --include-bursts         keep czkawka-only single-burst groups
+    --limit N                scan only the first N groups (smoke tests)
     --skip-czkawka/--skip-exif  skip those scan steps
     --near N                 czkawka image max distance (default 10)
     --max-wal-gb F           refuse osxphotos reader above this WAL size (2.0)
@@ -323,18 +336,28 @@ class UnionFind:
             self.parent[rb] = ra
 
 
-def build_apple_tranches(rows: List[Tuple[str, Optional[int], Optional[int]]]
+_SOURCE_NAMES = {"P": "apple-perceptual", "M": "apple-metadata", "C": "czkawka"}
+
+
+def build_apple_tranches(rows: List[Tuple[str, Optional[int], Optional[int]]],
+                         czkawka_groups: Optional[List[Set[str]]] = None
                          ) -> List[dict]:
-    """rows = (uuid, perceptual_group_id, metadata_group_id). Assets sharing
-    either group id merge into one tranche; an asset in both a perceptual and
-    a metadata group bridges them. Group-id namespaces are kept apart with a
-    prefix. Singletons (their partners are all in the trash, etc.) drop out."""
+    """rows = (uuid, perceptual_group_id, metadata_group_id) from Apple's
+    analysis; czkawka_groups = discovered groups from a full-library czkawka
+    sweep. All of them feed ONE union-find, so an Apple pair plus a czkawka
+    group containing a third copy fuse into a single 3-member tranche, and
+    czkawka links between two Apple groups merge them. Group-id namespaces
+    are kept apart with a prefix (P/M/C), which is also where each tranche's
+    sources come from. Singletons drop out."""
     uf = UnionFind()
     group_members: Dict[str, List[str]] = {}
     for uuid, pgrp, mgrp in rows:
         for prefix, grp in (("P", pgrp), ("M", mgrp)):
             if grp is not None:
                 group_members.setdefault(f"{prefix}{grp}", []).append(uuid)
+    for i, grp in enumerate(czkawka_groups or []):
+        if len(grp) >= 2:
+            group_members[f"C{i}"] = sorted(grp)
     for gid, uuids in group_members.items():
         for other in uuids[1:]:
             uf.union(uuids[0], other)
@@ -352,8 +375,7 @@ def build_apple_tranches(rows: List[Tuple[str, Optional[int], Optional[int]]]
         if len(members) < 2:
             continue
         gids = sorted(set().union(*(uuid_groups[u] for u in members)))
-        sources = sorted({"apple-perceptual" if g[0] == "P" else "apple-metadata"
-                          for g in gids})
+        sources = sorted({_SOURCE_NAMES[g[0]] for g in gids})
         tranches.append({
             "key": tranche_key(members),
             "members": members,
@@ -368,6 +390,33 @@ def tranche_key(uuids: Iterable[str]) -> str:
     """Stable id for a set of assets, independent of discovery order."""
     joined = "\n".join(sorted(u.upper() for u in uuids))
     return hashlib.sha1(joined.encode()).hexdigest()[:12]
+
+
+def drop_burst_only_tranches(tranches: List[dict], members: Dict[str, dict]
+                             ) -> Tuple[List[dict], int]:
+    """A czkawka-only group whose members all belong to one burst is burst
+    siblings, not duplicates -- at loose perceptual distance czkawka groups
+    them enthusiastically. Groups Apple also flagged are kept regardless
+    (Apple's analysis distinguishes bursts from re-imports)."""
+    kept, dropped = [], 0
+    for t in tranches:
+        if t["sources"] == ["czkawka"]:
+            keys = {(members.get(u) or {}).get("burst_key") for u in t["members"]}
+            if len(keys) == 1 and next(iter(keys)):
+                dropped += 1
+                continue
+        kept.append(t)
+    return kept, dropped
+
+
+def czkawka_group_sets(out_dir: Path) -> List[Set[str]]:
+    """Every czkawka group (dup + image + video) as a set of asset uuids,
+    for feeding the tranche union-find in discovery mode."""
+    sets: List[Set[str]] = []
+    for name in ("czkawka_dup.json", "czkawka_image.json", "czkawka_video.json"):
+        for group in load_czkawka(out_dir, name):
+            sets.append(set(group))
+    return sets
 
 
 def farm_name(uuid: str, path: str) -> str:
@@ -542,9 +591,11 @@ def library_generation(conn: sqlite3.Connection, wal_bytes: int) -> dict:
 
 
 def read_members_sqlite(conn: sqlite3.Connection, library: Path,
-                        uuids: Set[str], verbose: Callable) -> Dict[str, dict]:
+                        uuids: Optional[Set[str]], verbose: Callable
+                        ) -> Dict[str, dict]:
     """Member metadata straight from ZASSET (live WAL read, nothing copied).
-    Optional columns are guarded so schema drift degrades instead of breaking."""
+    uuids=None indexes every asset (discovery mode). Optional columns are
+    guarded so schema drift degrades instead of breaking."""
     cols = table_columns(conn, "ZASSET")
     aaa_cols = table_columns(conn, "ZADDITIONALASSETATTRIBUTES")
 
@@ -570,7 +621,7 @@ def read_members_sqlite(conn: sqlite3.Connection, library: Path,
     rows = conn.execute(f"SELECT {', '.join(parts)} FROM ZASSET a {join}").fetchall()
     for r in rows:
         uuid = _norm_uuid(r["uuid"])
-        if uuid not in uuids:
+        if uuids is not None and uuid not in uuids:
             continue
         # ZDIRECTORY is the shard char ("5") for plain assets, but a full
         # library-relative path ("scopes/syndication/...") for shared ones
@@ -613,90 +664,110 @@ def read_members_sqlite(conn: sqlite3.Connection, library: Path,
             "description": None,
             "reader": "sqlite",
         }
-    found = set(members)
-    for uuid in sorted(uuids - found):
-        verbose(f"  warning: {uuid} in a duplicate group but not readable; skipping")
+    if uuids is not None:
+        for uuid in sorted(uuids - set(members)):
+            verbose(f"  warning: {uuid} in a duplicate group but not readable; skipping")
     return members
 
 
-def read_members_osxphotos(library: Optional[Path], uuids: Set[str],
-                           verbose: Callable) -> Tuple[Dict[str, dict], Path]:
-    """Rich member metadata via the osxphotos package (albums, keywords,
-    Live/RAW/burst pairing, derivative previews for thumbnails)."""
+def _photoinfo_lite(p) -> dict:
+    """The cheap scalar fields of one PhotoInfo -- what the library-wide
+    index holds. Albums/keywords/derivatives are enriched later, only for
+    assets that end up in tranches."""
+    d = p.date
+    if d is not None and d.tzinfo is not None:
+        d = d.astimezone().replace(tzinfo=None)
+    added = p.date_added
+    if added is not None and added.tzinfo is not None:
+        added = added.astimezone().replace(tzinfo=None)
+    path = p.path
+    ext = os.path.splitext(p.original_filename or p.filename or "")[1].lstrip(".").lower()
+    if not ext and path:
+        ext = os.path.splitext(path)[1].lstrip(".").lower()
+    flags = []
+    if getattr(p, "syndicated", None) and not getattr(p, "saved_to_library", True):
+        flags.append("shared-with-you")
+    if p.hidden:
+        flags.append("hidden")
+    if getattr(p, "shared", False):
+        flags.append("shared-album")
+    if getattr(p, "intrash", False):
+        flags.append("trash")
+    if getattr(p, "ismissing", False) or not path:
+        flags.append("missing")
+    if getattr(p, "ismovie", False) or ext in VIDEO_EXTS:
+        flags.append("video")
+    if getattr(p, "live_photo", False):
+        flags.append("live")
+    if getattr(p, "has_raw", False):
+        flags.append("raw")
+    if getattr(p, "burst", False):
+        flags.append("burst")
+    return {
+        "uuid": _norm_uuid(p.uuid),
+        "filename": p.original_filename or p.filename or p.uuid,
+        "ext": ext,
+        "path": path,
+        "thumb_source": path,
+        "size": getattr(p, "original_filesize", None),
+        "width": p.width,
+        "height": p.height,
+        "photos_date": iso(d),
+        "date_added": iso(added),
+        "favorite": bool(p.favorite),
+        "flags": flags,
+        "burst_key": getattr(p, "burst_key", None),
+        "album_uuids": [],
+        "albums": [],
+        "keywords": [],
+        "title": None,
+        "description": None,
+        "reader": "osxphotos",
+    }
+
+
+def read_all_osxphotos(library: Optional[Path], verbose: Callable
+                       ) -> Tuple[object, Dict[str, dict], Path]:
+    """Index every (non-trash) asset via osxphotos: one pass over
+    db.photos(), scalar fields only. Returns the loaded db too, so tranche
+    members can be enriched from it without a second library load."""
     import osxphotos
 
     verbose("loading the Photos library via osxphotos (may take a while)...")
     db = osxphotos.PhotosDB(dbfile=str(library)) if library else osxphotos.PhotosDB()
     lib_path = Path(db.library_path)
     verbose(f"loaded {lib_path}")
-
     members: Dict[str, dict] = {}
+    for p in db.photos():
+        m = _photoinfo_lite(p)
+        members[m["uuid"]] = m
+    verbose(f"indexed {len(members):,} assets")
+    return db, members, lib_path
+
+
+def enrich_members_osxphotos(db, members: Dict[str, dict], uuids: Set[str],
+                             verbose: Callable) -> None:
+    """Fill in the expensive fields (albums, album uuids, keywords, titles,
+    derivative thumbnails, exact byte size) for tranche members only."""
+    verbose(f"enriching {len(uuids):,} tranche member(s) with albums/keywords...")
     for uuid in sorted(uuids):
         p = db.get_photo(uuid)
-        if p is None:
-            verbose(f"  warning: {uuid} in a duplicate group but not in the "
-                    "osxphotos view of the library; skipping")
+        m = members.get(uuid)
+        if p is None or m is None:
             continue
-        d = p.date
-        if d is not None and d.tzinfo is not None:
-            d = d.astimezone().replace(tzinfo=None)
-        added = p.date_added
-        if added is not None and added.tzinfo is not None:
-            added = added.astimezone().replace(tzinfo=None)
-        path = p.path
-        ext = os.path.splitext(p.original_filename or p.filename or "")[1].lstrip(".").lower()
-        if not ext and path:
-            ext = os.path.splitext(path)[1].lstrip(".").lower()
-        flags = []
-        if getattr(p, "syndicated", None) and not getattr(p, "saved_to_library", True):
-            flags.append("shared-with-you")
-        if p.hidden:
-            flags.append("hidden")
-        if getattr(p, "shared", False):
-            flags.append("shared-album")
-        if getattr(p, "intrash", False):
-            flags.append("trash")
-        if getattr(p, "ismissing", False) or not path:
-            flags.append("missing")
-        if getattr(p, "ismovie", False) or ext in VIDEO_EXTS:
-            flags.append("video")
-        if getattr(p, "live_photo", False):
-            flags.append("live")
-        if getattr(p, "has_raw", False):
-            flags.append("raw")
-        if getattr(p, "burst", False):
-            flags.append("burst")
+        m["albums"] = sorted(set(p.albums or []))
+        m["album_uuids"] = sorted(
+            [[a.uuid, a.title] for a in (getattr(p, "album_info", None) or [])
+             if getattr(a, "uuid", None)])
+        m["keywords"] = sorted(set(p.keywords or []))
+        m["title"] = p.title
+        m["description"] = p.description
         derivatives = [d for d in (getattr(p, "path_derivatives", None) or [])
                        if str(d).lower().endswith((".jpg", ".jpeg"))]
-        size = None
-        if path and os.path.exists(path):
-            size = os.path.getsize(path)
-        else:
-            size = getattr(p, "original_filesize", None)
-        members[_norm_uuid(uuid)] = {
-            "uuid": _norm_uuid(uuid),
-            "filename": p.original_filename or p.filename or uuid,
-            "ext": ext,
-            "path": path,
-            "thumb_source": (derivatives[0] if derivatives else path),
-            "size": size,
-            "width": p.width,
-            "height": p.height,
-            "photos_date": iso(d),
-            "date_added": iso(added),
-            "favorite": bool(p.favorite),
-            "flags": flags,
-            "burst_key": getattr(p, "burst_key", None),
-            "album_uuids": sorted(
-                [[a.uuid, a.title] for a in (getattr(p, "album_info", None) or [])
-                 if getattr(a, "uuid", None)]),
-            "albums": sorted(set(p.albums or [])),
-            "keywords": sorted(set(p.keywords or [])),
-            "title": p.title,
-            "description": p.description,
-            "reader": "osxphotos",
-        }
-    return members, lib_path
+        if derivatives:
+            m["thumb_source"] = derivatives[0]
+        if m.get("path") and os.path.exists(m["path"]):
+            m["size"] = os.path.getsize(m["path"])
 
 
 def run_exiftool(members: Dict[str, dict], out_dir: Path, verbose: Callable) -> dict:
@@ -804,62 +875,95 @@ def cmd_scan(args: argparse.Namespace) -> int:
         reader = "osxphotos"
 
     verbose(f"Library: {library}")
+    farm_dir = Path(args.farm_dir or (out_dir / "farm"))
+    db = None
     conn = sqlite_ro(db_path)
     try:
         rows = read_apple_groups(conn)
         generation = library_generation(conn, wal_bytes)
-        tranches = build_apple_tranches(rows)
-        verbose(f"Apple duplicate analysis: {len(rows):,} asset(s) in "
-                f"{len(tranches):,} group(s) "
+        verbose(f"Apple duplicate analysis: {len(rows):,} asset(s) "
                 f"(library: {generation['asset_count']:,} assets)")
-        if args.limit:
-            tranches = tranches[:args.limit]
-            verbose(f"--limit {args.limit}: keeping the first {len(tranches)} group(s)")
-        uuids: Set[str] = set()
-        for t in tranches:
-            uuids.update(t["members"])
-
         if reader == "sqlite":
-            members = read_members_sqlite(conn, library, uuids, verbose)
+            members = read_members_sqlite(conn, library, None, verbose)
         else:
-            members, library = read_members_osxphotos(
-                Path(args.library) if args.library else None, uuids, verbose)
+            db, members, library = read_all_osxphotos(
+                Path(args.library) if args.library else None, verbose)
     finally:
         conn.close()
+
+    total_local = sum(1 for m in members.values() if m.get("path"))
+
+    # Discovery: czkawka sweeps EVERY local, mergeable original, and its
+    # groups join Apple's in the union-find below -- extra copies Apple
+    # missed attach to their tranches, czkawka-only tranches appear.
+    cz_group_sets: Optional[List[Set[str]]] = None
+    if args.discover and not args.skip_czkawka:
+        farm_uuids = {u for u, m in members.items()
+                      if m.get("path")
+                      and not any(f in VISIBILITY_FLAGS for f in m["flags"])}
+        verbose(f"discovery: {len(farm_uuids):,} local mergeable original(s) "
+                f"to sweep ({len(members) - total_local:,} assets have no "
+                "local original and are invisible to discovery)")
+        build_farm({u: members[u] for u in farm_uuids}, farm_dir, verbose)
+        run_czkawka(farm_dir, out_dir, args.near, verbose)
+        cz_group_sets = czkawka_group_sets(out_dir)
+        verbose(f"czkawka: {len(cz_group_sets):,} group(s) across the sweep")
+
+    tranches = build_apple_tranches(rows, cz_group_sets)
+    verbose(f"{len(tranches):,} combined tranche(s) before filtering")
+
+    dropped_bursts = 0
+    if args.discover and not args.include_bursts:
+        tranches, dropped_bursts = drop_burst_only_tranches(tranches, members)
+        if dropped_bursts:
+            verbose(f"dropped {dropped_bursts:,} czkawka-only burst-sibling "
+                    "group(s) (--include-bursts keeps them)")
+
+    if args.limit:
+        tranches = tranches[:args.limit]
+        verbose(f"--limit {args.limit}: keeping the first {len(tranches)} group(s)")
 
     # drop members that could not be read at all, and groups that collapse
     tranches = [dict(t, members=[u for u in t["members"] if u in members])
                 for t in tranches]
     tranches = [t for t in tranches if len(t["members"]) >= 2]
+    uuids = {u for t in tranches for u in t["members"]}
 
-    exif = {} if args.skip_exif else run_exiftool(members, out_dir, verbose)
+    if db is not None:
+        enrich_members_osxphotos(db, members, uuids, verbose)
+
+    scan_members = {u: members[u] for u in sorted(uuids)}
+    exif = {} if args.skip_exif else run_exiftool(scan_members, out_dir, verbose)
     for uuid, tags in exif.items():
-        members[uuid]["exif"] = tags
+        scan_members[uuid]["exif"] = tags
 
-    if not args.skip_czkawka:
-        farm_members = {u: m for u, m in members.items() if u in uuids}
-        build_farm(farm_members, Path(args.farm_dir or (out_dir / "farm")), verbose)
-        run_czkawka(Path(args.farm_dir or (out_dir / "farm")), out_dir,
-                    args.near, verbose)
+    # apple-only mode: czkawka runs as a verifier over just the tranche
+    # members (discovery mode already scanned them all above)
+    if not args.discover and not args.skip_czkawka:
+        build_farm({u: scan_members[u] for u in scan_members
+                    if scan_members[u].get("path")}, farm_dir, verbose)
+        run_czkawka(farm_dir, out_dir, args.near, verbose)
 
-    local = sum(1 for m in members.values() if m.get("path"))
+    local = sum(1 for m in scan_members.values() if m.get("path"))
     scan = {
         "version": PLAN_VERSION,
         "script": SCRIPT,
         "generated": datetime.now().strftime(ISO_FMT),
         "library": str(library),
         "reader": reader,
+        "discover": bool(args.discover),
+        "dropped_burst_only": dropped_bursts,
         "generation": generation,
         "near": args.near,
         "apple_tranches": tranches,
-        "members": {u: members[u] for u in sorted(members)},
+        "members": scan_members,
     }
     (out_dir / "scan.json").write_text(json.dumps(scan, indent=1, sort_keys=True))
-    verbose(f"\nWrote {out_dir / 'scan.json'}: {len(tranches):,} group(s), "
-            f"{len(members):,} member(s), {local:,} with local originals"
-            + ("" if local == len(members) else
-               f" ({len(members) - local:,} not downloaded -- czkawka cannot "
-               "verify those; consider 'Download Originals to this Mac')"))
+    verbose(f"\nWrote {out_dir / 'scan.json'}: {len(tranches):,} tranche(s), "
+            f"{len(scan_members):,} member(s), {local:,} with local originals"
+            + ("" if local == len(scan_members) else
+               f" ({len(scan_members) - local:,} not downloaded -- czkawka "
+               "cannot verify those; consider 'Download Originals to this Mac')"))
     verbose(f"Next: osxphotos run {SCRIPT} plan --out {out_dir}")
     return 0
 
@@ -941,10 +1045,16 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
 
     tier_counts: Dict[str, int] = {}
     warning_counts: Dict[str, int] = {}
+    source_counts: Dict[str, int] = {}
     for t in tranches:
         tier_counts[t["tier"]] = tier_counts.get(t["tier"], 0) + 1
         for w in t["warnings"]:
             warning_counts[w] = warning_counts.get(w, 0) + 1
+        has_cz = "czkawka" in t["sources"]
+        has_apple = any(s.startswith("apple") for s in t["sources"])
+        cls = ("both" if has_cz and has_apple
+               else "czkawka-only" if has_cz else "apple-only")
+        source_counts[cls] = source_counts.get(cls, 0) + 1
 
     plan_body = {
         "version": PLAN_VERSION,
@@ -963,6 +1073,7 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
             "tranches": len(tranches),
             "members": sum(len(t["members"]) for t in tranches),
             "losers": sum(len(t["members"]) - 1 for t in tranches),
+            "by_source": dict(sorted(source_counts.items())),
             "tiers": dict(sorted(tier_counts.items())),
             "warnings": dict(sorted(warning_counts.items())),
             "suggested_auto_approve": sum(1 for t in tranches if t["suggested"]),
@@ -1014,6 +1125,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
     s = plan["summary"]
     print(f"Plan: {s['tranches']:,} tranche(s), {s['members']:,} member(s), "
           f"{s['losers']:,} proposed removal(s)")
+    print("Sources: " + ", ".join(f"{k}={v}" for k, v in s["by_source"].items()))
     print(f"Tiers: " + ", ".join(f"{k}={v}" for k, v in s["tiers"].items()))
     if s["warnings"]:
         print("Warnings: " + ", ".join(f"{k}={v}" for k, v in s["warnings"].items()))
@@ -1300,6 +1412,9 @@ kbd { font: 12px ui-monospace, monospace; padding: 0 5px; border-radius: 4px;
     <option value="video">tier: video</option>
     <option value="partial">tier: partial</option>
     <option value="unverified">tier: unverified</option>
+    <option value="src-czkawka">source: czkawka only</option>
+    <option value="src-apple">source: apple only</option>
+    <option value="src-both">source: both</option>
   </select>
   <button id="approve-shown">Approve all shown</button>
   <button id="clear-shown">Clear shown</button>
@@ -1346,6 +1461,10 @@ function matches(t, f) {
   if (f === "all") return true;
   if (f === "warnings") return t.warnings.length > 0;
   if (["undecided", "approved", "rejected"].includes(f)) return state(t.key) === f;
+  const cz = t.sources.includes("czkawka");
+  if (f === "src-czkawka") return cz && t.sources.length === 1;
+  if (f === "src-apple") return !cz;
+  if (f === "src-both") return cz && t.sources.length > 1;
   return t.tier === f;
 }
 
@@ -2085,8 +2204,15 @@ def add_scan_args(p: argparse.ArgumentParser) -> None:
                    default="auto",
                    help="metadata reader (default auto = osxphotos, refused "
                    "while the WAL is huge; sqlite reads live, fewer fields)")
+    p.add_argument("--discover", action="store_true",
+                   help="sweep ALL local originals with czkawka, not just "
+                   "Apple's groups: finds copies Apple missed, attaches them "
+                   "to Apple's tranches, and surfaces czkawka-only tranches")
+    p.add_argument("--include-bursts", action="store_true",
+                   help="keep czkawka-only groups made entirely of one burst "
+                   "(burst siblings; dropped by default)")
     p.add_argument("--limit", type=int, metavar="N",
-                   help="only the first N Apple groups (smoke tests)")
+                   help="only the first N groups (smoke tests)")
     p.add_argument("--near", type=int, default=DEFAULT_NEAR,
                    help=f"czkawka image max distance (default {DEFAULT_NEAR})")
     p.add_argument("--skip-czkawka", action="store_true",
@@ -2325,6 +2451,37 @@ def selftest() -> None:
     assert bridged["sources"] == ["apple-metadata", "apple-perceptual"]
     assert tranche_key(["b", "a"]) == tranche_key(["A", "B"])
     assert tr == sorted(tr, key=lambda t: t["key"])
+
+    # discovery: czkawka groups join the same union-find. An Apple pair plus
+    # a czkawka group holding a third copy fuse into one 3-member tranche;
+    # czkawka-only groups become their own tranches.
+    trd = build_apple_tranches([("U1", 10, None), ("U2", 10, None)],
+                               [{"U2", "U3"}, {"X1", "X2"}, {"LONE"}])
+    assert len(trd) == 2
+    fused = next(t for t in trd if "U1" in t["members"])
+    assert fused["members"] == ["U1", "U2", "U3"]
+    assert fused["sources"] == ["apple-perceptual", "czkawka"]
+    cz_only = next(t for t in trd if "X1" in t["members"])
+    assert cz_only["sources"] == ["czkawka"]
+    assert build_apple_tranches([("U1", 10, None), ("U2", 10, None)]) \
+        == build_apple_tranches([("U1", 10, None), ("U2", 10, None)], None)
+
+    # burst guard: czkawka-only single-burst groups drop; mixed or
+    # Apple-flagged ones stay
+    mem_b = {
+        "X1": _member("X1", burst_key="BK1"), "X2": _member("X2", burst_key="BK1"),
+        "Y1": _member("Y1", burst_key="BK2"), "Y2": _member("Y2"),
+        "U1": _member("U1", burst_key="BK3"), "U2": _member("U2", burst_key="BK3"),
+        "U3": _member("U3", burst_key="BK3"),
+    }
+    trb = build_apple_tranches([("U1", 10, None), ("U2", 10, None)],
+                               [{"X1", "X2"}, {"Y1", "Y2"}, {"U2", "U3"}])
+    kept, dropped = drop_burst_only_tranches(trb, mem_b)
+    assert dropped == 1  # {X1,X2}: czkawka-only, one burst
+    kept_sets = [set(t["members"]) for t in kept]
+    assert {"Y1", "Y2"} in kept_sets          # mixed burst membership
+    assert {"U1", "U2", "U3"} in kept_sets    # apple-sourced, kept regardless
+    assert drop_burst_only_tranches([], {}) == ([], 0)
 
     # farm names round-trip
     assert farm_uuid(farm_name("ABC-123", "/x/y/IMG__weird__name.HEIC")) == "ABC-123"

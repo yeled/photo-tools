@@ -149,9 +149,21 @@ HEIC) by hardlinking the originals into a scratch farm and running its exact
 
 ```sh
 osxphotos run dedupe_photos.py all --open       # scan + plan + review report
+osxphotos run dedupe_photos.py scan --discover  # sweep the ENTIRE library
 osxphotos run dedupe_photos.py scan --limit 5   # smoke test on 5 groups
 python3 dedupe_photos.py --selftest             # offline tests, safe anywhere
 ```
+
+Without `--discover`, tranches are exactly Apple's groups and czkawka only
+*verifies* them. With `--discover`, czkawka sweeps **every local original**
+and its groups feed the same union-find as Apple's: copies Apple missed
+attach to their tranches (3-, 4-, N-member tranches), czkawka links merge
+Apple groups that are really one photo, and czkawka-only tranches appear
+(filter by source in the review page). czkawka-only groups that are entirely
+one burst are dropped as burst siblings (`--include-bursts` keeps them);
+assets with no local original are invisible to discovery and counted in the
+scan output. The first sweep perceptually hashes the whole library — hours,
+cached and incremental afterwards.
 
 The plan fixes what Apple's Merge button gets wrong: the **keeper** is chosen
 by resolution → file size → format (RAW > HEIC > PNG > JPEG) → UUID, never by
