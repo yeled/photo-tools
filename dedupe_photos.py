@@ -2416,13 +2416,59 @@ def cmd_apply(args: argparse.Namespace) -> int:
         raise SystemExit(f"{helper} not built -- run: make -C {helper.parent}")
 
     log: dict = {"decisions": str(args.decisions), "worklist": work,
+                 "status": "started", "phase": "none",
                  "photoscript_failed_tranches": [], "date_mismatches": [],
                  "helper_metadata_rc": None, "helper_deletes_rc": None,
                  "deletes_cancelled": False}
     held_back: Set[str] = set()
 
+    # The undo record (keepers' old dates, losers' uuids) is written BEFORE
+    # anything is modified and re-flushed after every phase, so an interrupt
+    # or a crash mid-apply can never leave writes without a record of them.
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = out_dir / f"apply-log-{stamp}.json"
+
+    def flush_log() -> None:
+        log_path.write_text(json.dumps(log, indent=1, sort_keys=True))
+
+    flush_log()
+    print(f"\nApply log started (undo record): {log_path}")
+
+    try:
+        _apply_phases(args, work, helper, meta_manifest, del_manifest,
+                      library, log, held_back, flush_log)
+        log["status"] = "complete"
+    except KeyboardInterrupt:
+        log["status"] = "interrupted"
+        print(f"\nInterrupted during phase '{log['phase']}'. The log above "
+              "records what was planned and what completed; rerun apply to "
+              "continue (finished tranches are detected and skipped).")
+        raise SystemExit(130)
+    except SystemExit:
+        log["status"] = "failed"
+        raise
+    finally:
+        flush_log()
+
+    print(f"\nApply log (undo record: old dates, deleted uuids): {log_path}")
+    print("Deleted items sit in Recently Deleted for 30 days; date changes "
+          "are listed in the log and revertible with osxphotos timewarp --reset.")
+    print(f"Check the outcome with: osxphotos run {SCRIPT} verify "
+          f"--decisions {args.decisions} --out {out_dir}")
+    return 0
+
+
+def _apply_phases(args: argparse.Namespace, work: dict, helper: Path,
+                  meta_manifest: Path, del_manifest: Path, library: Path,
+                  log: dict, held_back: Set[str], flush_log: Callable) -> None:
+    """The write phases, in safety order. Split out so cmd_apply can wrap the
+    whole thing in the log's try/finally."""
+    out_dir = Path(args.out)
+
     if not args.skip_photoscript and (work["albums"] or work["keywords"]
                                       or work["texts"]):
+        log["phase"] = "photoscript-metadata"
+        flush_log()
         print("\nMerging albums/keywords/titles via photoscript "
               "(Photos must be running)...")
         try:
@@ -2436,9 +2482,12 @@ def cmd_apply(args: argparse.Namespace) -> int:
         log["photoscript_failed_tranches"] = sorted(failed)
 
     if work["dates"] or work["favorites"]:
+        log["phase"] = "photokit-dates-favorites"
+        flush_log()
         print("\nWriting dates/favorites via merge-helper (PhotoKit)...")
         rc = run_helper(helper, meta_manifest, True, print)
         log["helper_metadata_rc"] = rc
+        flush_log()
         if rc != 0:
             print(f"merge-helper metadata pass exited {rc}; verifying what "
                   "landed before considering deletes...")
@@ -2459,6 +2508,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
                       f"library has {post[e['uuid']]['date']}")
         if not log["date_mismatches"]:
             print(f"  all {len(work['dates']):,} keeper date(s) verified")
+        flush_log()
 
     deletes = [e for e in work["deletes"] if e["tranche"] not in held_back]
     held_deletes = len(work["deletes"]) - len(deletes)
@@ -2469,6 +2519,9 @@ def cmd_apply(args: argparse.Namespace) -> int:
     if args.skip_deletes:
         print(f"\n--skip-deletes: leaving {len(deletes):,} loser(s) in place.")
     elif deletes:
+        log["phase"] = "photokit-deletes"
+        log["deletes_attempted"] = [e["uuid"] for e in deletes]
+        flush_log()
         del_manifest.write_text(json.dumps(
             {"deletes": [e["uuid"] for e in deletes]}, indent=1, sort_keys=True))
         print(f"\nDeleting {len(deletes):,} loser(s) via merge-helper -- "
@@ -2479,15 +2532,112 @@ def cmd_apply(args: argparse.Namespace) -> int:
             log["deletes_cancelled"] = True
             print("Delete dialog cancelled; keepers are merged, losers remain. "
                   "Rerun apply to try the deletes again.")
+    log["phase"] = "done"
 
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_path = out_dir / f"apply-log-{stamp}.json"
-    log_path.write_text(json.dumps(log, indent=1, sort_keys=True))
-    print(f"\nApply log (undo record: old dates, deleted uuids): {log_path}")
-    print("Deleted items sit in Recently Deleted for 30 days; date changes "
-          "are listed in the log and revertible with osxphotos timewarp --reset.")
-    print(f"Check the outcome with: osxphotos run {SCRIPT} verify "
-          f"--decisions {args.decisions} --out {out_dir}")
+
+def _stage_rows(out_dir: Path) -> List[Tuple[str, bool, str]]:
+    """(stage, done, detail) for each pipeline stage, read off the out dir."""
+    scan_p, plan_p = out_dir / "scan.json", out_dir / "plan.json"
+    report_p = out_dir / "report" / "index.html"
+    dec_p = out_dir / "decisions.json"
+    rows = []
+
+    scan = plan = None
+    if scan_p.exists():
+        try:
+            scan = json.loads(scan_p.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    rows.append(("scan", scan is not None,
+                 (f"{len(scan['apple_tranches']):,} tranches, "
+                  f"{len(scan['members']):,} members"
+                  f"{', discovery' if scan.get('discover') else ', apple-only'}")
+                 if scan else "not run"))
+
+    if plan_p.exists():
+        try:
+            plan = json.loads(plan_p.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    stale = bool(plan and scan and plan_p.stat().st_mtime < scan_p.stat().st_mtime)
+    rows.append(("plan", plan is not None and not stale,
+                 (f"{plan['summary']['tranches']:,} tranches, "
+                  f"{plan['summary']['losers']:,} proposed removals"
+                  + (" -- STALE, older than scan.json" if stale else ""))
+                 if plan else "not run"))
+
+    r_stale = bool(plan and report_p.exists()
+                   and report_p.stat().st_mtime < plan_p.stat().st_mtime)
+    rows.append(("review", report_p.exists() and not r_stale,
+                 ("rendered" + (" -- STALE, older than plan.json" if r_stale
+                                else ""))
+                 if report_p.exists() else "not rendered"))
+
+    detail, done = "no decisions exported yet", False
+    if dec_p.exists() and plan:
+        try:
+            obj = json.loads(dec_p.read_text())
+            dec = obj.get("decisions") or {}
+            appr = [k for k, v in dec.items() if v.get("d") == "approved"]
+            keys = {t["key"] for t in plan["tranches"]}
+            live = [k for k in appr if k in keys]
+            match = obj.get("plan_key") == plan.get("plan_key")
+            detail = (f"{len(appr):,} approved ({len(live):,} in this plan)"
+                      + ("" if match else "; plan_key differs -> needs "
+                         "--force-plan-key"))
+            done = bool(live)
+        except (json.JSONDecodeError, OSError):
+            detail = "unreadable"
+    rows.append(("decisions", done, detail))
+
+    logs = sorted(out_dir.glob("apply-log-*.json"))
+    if logs:
+        try:
+            last = json.loads(logs[-1].read_text())
+            w = last.get("worklist") or {}
+            detail = (f"{logs[-1].name}: status={last.get('status','?')}, "
+                      f"{len(w.get('dates') or []):,} date(s), "
+                      f"{len(w.get('deletes') or []):,} delete(s)")
+        except (json.JSONDecodeError, OSError):
+            detail = f"{logs[-1].name}: unreadable"
+        rows.append(("apply", True, detail))
+    else:
+        rows.append(("apply", False, "never run -- nothing written to Photos"))
+    return rows
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Where am I, and what do I run next? The whole pipeline in one glance."""
+    out_dir = Path(args.out)
+    if not out_dir.exists():
+        print(f"{out_dir} does not exist yet -- start with:\n"
+              f"  osxphotos run {SCRIPT} scan --discover")
+        return 0
+    rows = _stage_rows(out_dir)
+    print(f"Working directory: {out_dir}\n")
+    for stage, done, detail in rows:
+        print(f"  [{'x' if done else ' '}] {stage:<10} {detail}")
+
+    state = {stage: done for stage, done, _ in rows}
+    dec = out_dir / "decisions.json"
+    print("\nNext:")
+    if not state["scan"]:
+        print(f"  osxphotos run {SCRIPT} scan --discover --out {out_dir}")
+    elif not state["plan"]:
+        print(f"  osxphotos run {SCRIPT} plan --out {out_dir}")
+    elif not state["review"]:
+        print(f"  osxphotos run {SCRIPT} review --out {out_dir} --serve --open")
+    elif not state["decisions"]:
+        print(f"  osxphotos run {SCRIPT} review --out {out_dir} --serve --open")
+        print("  ...then approve tranches and click 'Export decisions'")
+    else:
+        force = "" if "force-plan-key" not in str(rows[3][2]) else " --force-plan-key"
+        print(f"  osxphotos run {SCRIPT} apply --out {out_dir} "
+              f"--decisions {dec}{force}          # dry run")
+        print(f"  osxphotos run {SCRIPT} apply --out {out_dir} "
+              f"--decisions {dec}{force} --apply  # write")
+        print(f"  osxphotos run {SCRIPT} verify --out {out_dir} "
+              f"--decisions {dec}{force}")
     return 0
 
 
@@ -2649,6 +2799,8 @@ examples:
         "apply", help="execute approved merges (dry-run without --apply)"))
     add_decisions_args(sub.add_parser(
         "verify", help="check approved tranches against the live library"))
+    add_out(sub.add_parser(
+        "status", help="where the pipeline stands and what to run next"))
     p_all = sub.add_parser("all", help="scan, plan, review in sequence")
     add_scan_args(p_all)
     p_all.add_argument("--min-plausible-year", type=int,
@@ -2683,6 +2835,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_apply(args)
     if args.command == "verify":
         return cmd_verify(args)
+    if args.command == "status":
+        return cmd_status(args)
     if args.command == "all":
         rc = cmd_scan(args)
         if rc:
