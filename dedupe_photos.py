@@ -236,6 +236,13 @@ def format_rank(ext: str) -> int:
     return 5
 
 
+def _hms(seconds: float) -> str:
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
+
+
 def hsize(n: Optional[int]) -> str:
     if not n:
         return "?"
@@ -407,6 +414,19 @@ def drop_burst_only_tranches(tranches: List[dict], members: Dict[str, dict]
                 continue
         kept.append(t)
     return kept, dropped
+
+
+CZKAWKA_TOOLS = ("dup", "image", "video")
+
+
+def parse_tools(value: str) -> List[str]:
+    """--czkawka-tools "dup,image" -> ["dup", "image"], in canonical order."""
+    names = [t.strip().lower() for t in (value or "").split(",") if t.strip()]
+    bad = [t for t in names if t not in CZKAWKA_TOOLS]
+    if bad:
+        raise SystemExit(f"unknown czkawka tool(s) {bad}; choose from "
+                         f"{', '.join(CZKAWKA_TOOLS)}")
+    return [t for t in CZKAWKA_TOOLS if t in names]
 
 
 def czkawka_group_sets(out_dir: Path) -> List[Set[str]]:
@@ -873,20 +893,53 @@ def run_czkawka(farm_dir: Path, out_dir: Path, near: int, verbose: Callable,
         "image": [czkawka, "image", *dir_args, "-m", "1024", "-s", str(near)],
         "video": [czkawka, "video", *dir_args, "-m", "1024"],
     }
+    # czkawka renders a live progress bar (indicatif) on stderr. Capturing
+    # stderr hides it, so let it through whenever we are on a terminal --
+    # long passes (video especially) are otherwise completely silent.
+    show_progress = sys.stderr.isatty()
     for label in tools:
         json_path = out_dir / f"{json_prefix}_{label}.json"
-        verbose(f"czkawka {label}: scanning...")
-        proc = subprocess.run(runs[label] + thread_args
-                              + ["-p", str(json_path), "-N", "-M", "-W"],
-                              capture_output=True, text=True)
+        started = datetime.now()
+        verbose(f"czkawka {label}: scanning... ({started:%H:%M:%S})")
+        # NOT subprocess.run(): it SIGKILLs the child on KeyboardInterrupt,
+        # which would kill czkawka in the milliseconds before it writes its
+        # hash cache -- throwing away hours of hashing. Ctrl+C already
+        # reaches czkawka directly (same process group) and it stops
+        # gracefully, so we wait for it instead of killing it.
+        proc = subprocess.Popen(
+            runs[label] + thread_args + ["-p", str(json_path), "-N", "-M", "-W"],
+            stdout=subprocess.PIPE,
+            stderr=(None if show_progress else subprocess.PIPE),
+            text=True)
+        try:
+            out, err = proc.communicate()
+        except KeyboardInterrupt:
+            verbose(f"\nczkawka {label}: stopping -- waiting for it to write "
+                    "its hash cache (do NOT kill it; a rerun then resumes "
+                    "from there)...")
+            try:
+                proc.communicate(timeout=900)
+                verbose("  czkawka exited cleanly; computed hashes are cached.")
+            except subprocess.TimeoutExpired:
+                verbose("  still saving after 15 min -- leaving it running; "
+                        "check the cache file's timestamp before rerunning.")
+            raise SystemExit(130)
+        elapsed = datetime.now() - started
         if proc.returncode != 0:
-            tail = (proc.stderr or proc.stdout or "").strip()[-400:]
+            tail = (err or out or "").strip()[-400:]
             verbose(f"  czkawka {label} failed (exit {proc.returncode}): {tail}")
             verbose(f"  continuing; tranches will show as unverified for {label}")
             json_path.write_text("[]")
         else:
-            groups = czkawka_uuid_groups(json.loads(json_path.read_text() or "[]"))
-            verbose(f"  czkawka {label}: {len(groups):,} group(s)")
+            # a graceful mid-run stop exits 0 without writing results
+            raw = json_path.read_text() if json_path.exists() else ""
+            if not raw.strip():
+                verbose(f"  czkawka {label}: no results written (stopped early?)")
+                json_path.write_text("[]")
+                raw = "[]"
+            groups = czkawka_uuid_groups(json.loads(raw))
+            verbose(f"  czkawka {label}: {len(groups):,} group(s) "
+                    f"in {_hms(elapsed.total_seconds())}")
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
@@ -908,6 +961,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             raise SystemExit(f"refusing --reader osxphotos: {reason}")
         reader = "osxphotos"
 
+    tools = parse_tools(args.czkawka_tools)
     verbose(f"Library: {library}")
     farm_dir = Path(args.farm_dir or (out_dir / "farm"))
     db = None
@@ -970,11 +1024,13 @@ def cmd_scan(args: argparse.Namespace) -> int:
                         if answer == "a":
                             pause = False
                     run_czkawka(farm_dir, out_dir, args.near, verbose,
-                                threads=args.threads, tools=("image", "video"),
+                                threads=args.threads,
+                                tools=[t for t in tools if t != "dup"],
                                 dirs=[d for d, _ in batch],
                                 json_prefix="czkawka_warm")
 
-        run_czkawka(farm_dir, out_dir, args.near, verbose, threads=args.threads)
+        run_czkawka(farm_dir, out_dir, args.near, verbose, threads=args.threads,
+                    tools=tools)
         cz_group_sets = czkawka_group_sets(out_dir)
         verbose(f"czkawka: {len(cz_group_sets):,} group(s) across the sweep")
 
@@ -1011,7 +1067,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     if not args.discover and not args.skip_czkawka:
         build_farm({u: scan_members[u] for u in scan_members
                     if scan_members[u].get("path")}, farm_dir, verbose)
-        run_czkawka(farm_dir, out_dir, args.near, verbose, threads=args.threads)
+        run_czkawka(farm_dir, out_dir, args.near, verbose, threads=args.threads,
+                    tools=tools)
 
     local = sum(1 for m in scan_members.values() if m.get("path"))
     scan = {
@@ -2292,7 +2349,13 @@ def add_scan_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--threads", type=int, default=0, metavar="N",
                    help="limit czkawka to N CPU threads (default: all cores)")
     p.add_argument("--skip-czkawka", action="store_true",
-                   help="skip the czkawka verification runs")
+                   help="skip the czkawka runs entirely")
+    p.add_argument("--czkawka-tools", default="dup,image,video", metavar="LIST",
+                   help="which czkawka tools to run, comma-separated (default "
+                   "dup,image,video). The video pass decodes every video via "
+                   "ffmpeg and is by far the slowest; 'dup' already catches "
+                   "byte-identical videos. Results from tools you skip are "
+                   "reused from a previous run if their JSON is still in --out.")
     p.add_argument("--skip-exif", action="store_true",
                    help="skip the exiftool date harvest")
     p.add_argument("--farm-dir", metavar="PATH",
@@ -2569,6 +2632,18 @@ def selftest() -> None:
     counts = [("a", 400), ("b", 400), ("c", 400), ("d", 400), ("e", 100)]
     batches = chunk_shards(counts, 700)
     assert [[s for s, _ in b] for b in batches] == [["a", "b"], ["c", "d"], ["e"]]
+    assert parse_tools("dup,image,video") == ["dup", "image", "video"]
+    assert parse_tools("video, dup") == ["dup", "video"]  # canonical order
+    assert parse_tools("IMAGE") == ["image"]
+    assert parse_tools("") == []
+    try:
+        parse_tools("dup,bogus")
+    except SystemExit as err:
+        assert "bogus" in str(err)
+    else:
+        raise AssertionError("expected SystemExit for unknown czkawka tool")
+    assert _hms(45) == "45s" and _hms(3725) == "1h02m" and _hms(125) == "2m05s"
+
     assert chunk_shards([], 1000) == []
     assert chunk_shards([("a", 10)], 1000) == [[("a", 10)]]
     one_each = chunk_shards([("a", 500), ("b", 600)], 100)
