@@ -267,6 +267,52 @@ def choose_keeper(members: List[dict]) -> str:
     return min(members, key=key)["uuid"]
 
 
+def _pixels(m: dict) -> int:
+    return (m.get("width") or 0) * (m.get("height") or 0)
+
+
+def keeper_reason(members: List[dict], keeper: str) -> str:
+    """Explain in one phrase which rule made this member the keeper.
+
+    Mirrors choose_keeper's ladder exactly (resolution -> bytes -> format ->
+    uuid) and names the rung that actually decided, so the review page can
+    answer "why this one?". When every rung ties the choice really is
+    arbitrary, and it says so rather than inventing a justification."""
+    k = next((m for m in members if m["uuid"] == keeper), None)
+    others = [m for m in members if m["uuid"] != keeper]
+    if k is None or not others:
+        return "only member"
+
+    dims = f"{k.get('width') or '?'}x{k.get('height') or '?'}"
+    kpix = _pixels(k)
+    best_other_pix = max(_pixels(m) for m in others)
+    if kpix > best_other_pix:
+        return f"highest resolution ({dims})"
+
+    same_pix = [m for m in others if _pixels(m) == kpix]
+    ksize = k.get("size") or 0
+    best_other_size = max((m.get("size") or 0) for m in same_pix)
+    if ksize > best_other_size:
+        # rounded sizes often render identically (a few bytes of EXIF apart);
+        # show the delta then, so "largest file" never looks like a tie -- and
+        # so a keeper decided by a handful of bytes reads as the near-toss-up
+        # it really is
+        if hsize(ksize) == hsize(best_other_size):
+            return (f"largest file by only {ksize - best_other_size:,} bytes "
+                    f"({hsize(ksize)}) - resolution tied at {dims}")
+        return (f"largest file ({hsize(ksize)} vs {hsize(best_other_size)}) "
+                f"- resolution tied at {dims}")
+
+    same_size = [m for m in same_pix if (m.get("size") or 0) == ksize]
+    krank = format_rank(k.get("ext") or "")
+    if krank < min(format_rank(m.get("ext") or "") for m in same_size):
+        return (f"better format (.{k.get('ext') or '?'}) - resolution and "
+                "file size tied")
+
+    return ("identical resolution, size and format - tie broken by UUID, so "
+            "this pick is arbitrary; choose by albums/keywords if it matters")
+
+
 def date_candidates(member: dict) -> List[Tuple[str, datetime]]:
     """(label, naive local datetime) for every timestamp this member offers,
     deterministic order."""
@@ -320,7 +366,9 @@ def merged_date(members: List[dict], min_year: int, now: datetime,
         spread = round((max(c[2] for c in exif_pool)
                         - min(c[2] for c in exif_pool)).total_seconds() / 86400, 1)
     if spread > spread_warn_days:
-        warnings.append(f"date-spread-{spread}d")
+        # flat label on purpose: the magnitude lives in date_spread_days, and
+        # baking it into the name gave one summary bucket per distinct value
+        warnings.append("date-spread")
     return iso(dt), f"{label}:{fname}", spread, warnings
 
 
@@ -1146,6 +1194,7 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
             "tier": tier,
             "czkawka_max_diff": max_diff,
             "keeper": choose_keeper(ms),
+            "keeper_reason": keeper_reason(ms, choose_keeper(ms)),
             "merged_date": m_date,
             "date_source": source,
             "date_spread_days": spread,
@@ -1254,7 +1303,10 @@ def cmd_plan(args: argparse.Namespace) -> int:
     print("Sources: " + ", ".join(f"{k}={v}" for k, v in s["by_source"].items()))
     print(f"Tiers: " + ", ".join(f"{k}={v}" for k, v in s["tiers"].items()))
     if s["warnings"]:
-        print("Warnings: " + ", ".join(f"{k}={v}" for k, v in s["warnings"].items()))
+        top = sorted(s["warnings"].items(), key=lambda kv: (-kv[1], kv[0]))
+        shown = ", ".join(f"{k}={v:,}" for k, v in top[:8])
+        extra = f", +{len(top) - 8} more kind(s)" if len(top) > 8 else ""
+        print(f"Warnings: {shown}{extra}")
     print(f"Suggested auto-approvals (exact/visual-0, no warnings): "
           f"{s['suggested_auto_approve']:,}")
     if s["czkawka_cross_tranche_links"]:
@@ -1290,7 +1342,22 @@ def make_thumb(src: str, dst: Path, is_video: bool, px: int) -> bool:
     return proc.returncode == 0 and dst.exists()
 
 
-def render_report(plan: dict, thumbs_ok: Set[str]) -> str:
+def load_saved_decisions(out_dir: Path) -> Dict[str, dict]:
+    """Decisions from a previous review session, if any, so a part-finished
+    review resumes instead of restarting. Keys that no longer name a tranche
+    are harmless -- apply only ever looks at tranches in the current plan."""
+    path = out_dir / "decisions.json"
+    if not path.exists():
+        return {}
+    try:
+        obj = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return obj.get("decisions") or {} if isinstance(obj, dict) else {}
+
+
+def render_report(plan: dict, thumbs_ok: Set[str],
+                  saved: Optional[Dict[str, dict]] = None) -> str:
     """Static review page. All member data reaches the DOM via textContent
     (never innerHTML), so filenames and titles cannot inject markup."""
     data = {
@@ -1307,6 +1374,7 @@ def render_report(plan: dict, thumbs_ok: Set[str]) -> str:
             for u, m in plan["members"].items()
         },
         "thumbs": sorted(thumbs_ok),
+        "saved_decisions": saved or {},
     }
     # <-escape every "<" so nothing in the data can ever terminate the
     # <script> block or read as markup ("<" never occurs in JSON syntax, so
@@ -1441,8 +1509,12 @@ def cmd_review(args: argparse.Namespace) -> int:
             if i % 500 == 0:
                 print(f"  {i:,}/{len(wanted):,}")
 
+    saved = load_saved_decisions(out_dir)
+    if saved:
+        print(f"carrying {len(saved):,} decision(s) forward from "
+              f"{out_dir / 'decisions.json'}")
     index = report_dir / "index.html"
-    index.write_text(render_report(plan, thumbs_ok), encoding="utf-8")
+    index.write_text(render_report(plan, thumbs_ok, saved), encoding="utf-8")
     missing = len(wanted) - len(thumbs_ok)
     print(f"Wrote {index} ({len(plan['tranches']):,} tranche(s)"
           + (f", {missing:,} thumbnail(s) unavailable" if missing else "") + ")")
@@ -1487,8 +1559,12 @@ main { padding: 12px 16px 80px; max-width: 1300px; margin: 0 auto; }
 .chip.tier-near, .chip.tier-video { background: #e8a02033; }
 .chip.tier-partial, .chip.tier-unverified { background: #cc333333; }
 .chip.warn { background: #cc333322; }
-.dateline { margin: 2px 0 8px; }
+.dateline { margin: 2px 0 2px; }
 .dateline b { color: #2e9e44; }
+.keeperline { margin: 0 0 8px; font-size: 12px; opacity: .85; }
+.keeperline b { color: #2e9e44; }
+.keeperline .why { opacity: .8; }
+.keeperline .manual { color: #e8a020; }
 .members { display: flex; gap: 10px; overflow-x: auto; }
 .member { min-width: 230px; max-width: 300px; border: 1px solid
           color-mix(in srgb, CanvasText 15%, Canvas); border-radius: 8px;
@@ -1562,6 +1638,11 @@ kbd { font: 12px ui-monospace, monospace; padding: 0 5px; border-radius: 4px;
 <tr><td><kbd>h</kbd> / <kbd>l</kbd></td><td>cycle keeper</td></tr>
 <tr><td><kbd>o</kbd></td><td>reveal keeper in Photos.app</td></tr>
 <tr><td><kbd>?</kbd></td><td>toggle this help</td></tr>
+<tr><td colspan="2" style="padding-top:8px;opacity:.75">
+keeper picked by: resolution → file size → format
+(RAW&gt;HEIC&gt;PNG&gt;JPEG) → UUID. Dates never affect it.</td></tr>
+<tr><td colspan="2" style="opacity:.75">
+decisions autosave in this browser and reload from decisions.json</td></tr>
 </table></div>
 <footer class="load"><button id="more" hidden>Show more</button></footer>
 <script id="data" type="application/json">__DATA__</script>
@@ -1573,9 +1654,22 @@ const THUMBS = new Set(DATA.thumbs);
 let dec = {};
 try { dec = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
 const save = () => localStorage.setItem(KEY, JSON.stringify(dec));
-const PAGE = 100;
-let view = [];      // filtered tranches, 1:1 with the cards in the DOM
-let rendered = 0;   // how many of them have cards so far
+
+// Decisions saved by a previous session (out-dir decisions.json, embedded at
+// render time) are folded in for tranches this browser has no opinion on --
+// so review can be picked up weeks later, on another machine, or after a
+// rescan. Anything already decided here wins; nothing is overwritten.
+let carried = 0;
+for (const [k, v] of Object.entries(DATA.saved_decisions || {})) {
+  if (!dec[k]) { dec[k] = v; carried++; }
+}
+if (carried) save();
+// A 40k-tranche plan cannot all live in the DOM, so cards are a sliding
+// window over `view`: MAX_RENDER at most, anchored at windowStart.
+const PAGE = 100, MAX_RENDER = 600;
+let view = [];         // filtered tranches (all of them, data only)
+let windowStart = 0;   // view index of the first card in the DOM
+let rendered = 0;      // how many cards are in the DOM
 let focusIdx = 0;
 let lastKey = "";
 const REVEAL = location.protocol === "http:" || location.protocol === "https:";
@@ -1609,12 +1703,15 @@ function setKeeper(t, uuid) {
   dec[t.key].k = uuid;
   save();
   const card = document.querySelector('.card[data-key="' + t.key + '"]');
-  if (card) card.querySelectorAll(".member").forEach(m => {
+  if (!card) return;
+  card.querySelectorAll(".member").forEach(m => {
     const mine = m.dataset.uuid === uuid;
     m.classList.toggle("keeper", mine);
     const radio = m.querySelector("input[type=radio]");
     if (radio) radio.checked = mine;
   });
+  const kl = card.querySelector(".keeperline");
+  if (kl) renderKeeperLine(t, kl);
 }
 
 function syncCard(card) {
@@ -1654,6 +1751,24 @@ function hsize(n) {
   const u = ["B", "KB", "MB", "GB"]; let i = 0, s = n;
   while (s >= 1024 && i < 3) { s /= 1024; i++; }
   return i ? s.toFixed(1) + " " + u[i] : s + " B";
+}
+
+// Why is THIS one the keeper? t.keeper_reason names the rule that decided
+// (resolution -> file size -> format -> uuid tiebreak). If the reviewer
+// picked someone else, say so and keep the default's rationale visible.
+function renderKeeperLine(t, kl) {
+  const cur = keeperOf(t);
+  const name = u => (DATA.members[u] || {}).filename || u;
+  kl.textContent = "";
+  kl.appendChild(el("span", "", "keeper "));
+  kl.appendChild(el("b", "", name(cur)));
+  if (cur === t.keeper) {
+    kl.appendChild(el("span", "why", " — " + (t.keeper_reason || "")));
+  } else {
+    kl.appendChild(el("span", "manual", " — your pick"));
+    kl.appendChild(el("span", "why",
+      "  (default was " + name(t.keeper) + ": " + (t.keeper_reason || "") + ")"));
+  }
 }
 
 function memberCard(t, uuid) {
@@ -1735,6 +1850,9 @@ function trancheCard(t) {
   dl.appendChild(el("span", "", "  from " + (t.date_source || "?") +
     (t.date_spread_days ? "  (spread " + t.date_spread_days + "d)" : "")));
   card.appendChild(dl);
+  const kl = el("div", "keeperline");
+  card.appendChild(kl);
+  renderKeeperLine(t, kl);
   const row = el("div", "members");
   t.members.forEach(u => row.appendChild(memberCard(t, u)));
   card.appendChild(row);
@@ -1757,21 +1875,41 @@ function counts() {
     const s = state(t.key);
     if (s === "approved") a++; else if (s === "rejected") r++;
   });
+  const win = view.length
+    ? "  ·  showing " + (windowStart + 1) + "–" + (windowStart + rendered) +
+      " of " + view.length
+    : "";
   document.getElementById("counts").textContent =
     DATA.tranches.length + " tranches · " + a + " approved · " +
-    r + " rejected · " + (DATA.tranches.length - a - r) + " undecided";
+    r + " rejected · " + (DATA.tranches.length - a - r) + " undecided" + win;
+}
+
+function cardAt(i) {
+  const off = i - windowStart;
+  const list = document.getElementById("list");
+  return (off >= 0 && off < rendered) ? list.children[off] : null;
 }
 
 function appendChunk() {
   const list = document.getElementById("list");
-  view.slice(rendered, rendered + PAGE).forEach(t =>
-    list.appendChild(trancheCard(t)));
-  rendered = Math.min(rendered + PAGE, view.length);
-  document.getElementById("more").hidden = rendered >= view.length;
+  const from = windowStart + rendered;
+  view.slice(from, from + PAGE).forEach(t => list.appendChild(trancheCard(t)));
+  rendered = Math.min(rendered + PAGE, view.length - windowStart);
+  while (rendered > MAX_RENDER) {  // drop from the front, keep the DOM small
+    for (let n = 0; n < PAGE && list.firstChild; n++)
+      list.removeChild(list.firstChild);
+    windowStart += PAGE;
+    rendered -= PAGE;
+  }
+  document.getElementById("more").hidden = windowStart + rendered >= view.length;
+  counts();
 }
 
-function ensureRendered(i) {
-  while (rendered <= i && rendered < view.length) appendChunk();
+function renderWindow(start) {
+  document.getElementById("list").textContent = "";
+  windowStart = Math.max(0, Math.min(start, Math.max(view.length - 1, 0)));
+  rendered = 0;
+  appendChunk();
 }
 
 // Moving focus swaps one CSS class and scrolls -- the DOM stays untouched,
@@ -1781,33 +1919,47 @@ function applyFocus(scroll) {
   const old = list.querySelector(".card.focused");
   if (old) old.classList.remove("focused");
   if (!view.length) return;
-  ensureRendered(focusIdx);
-  const card = list.children[focusIdx];
+  const card = cardAt(focusIdx);
   if (!card) return;
   card.classList.add("focused");
-  if (scroll) {
-    // clear the sticky header, whatever height it wrapped to
-    card.style.scrollMarginTop =
-      (document.querySelector("header").offsetHeight + 10) + "px";
-    card.style.scrollMarginBottom = "12px";
-    card.scrollIntoView({ block: "nearest" });
-  }
+  if (scroll) scrollCardIntoView(card);
+}
+
+// Explicit scrolling, not scrollIntoView(): after the window re-anchors, the
+// DOM has just been rebuilt and scrollIntoView goes by stale layout, leaving
+// the focused card thousands of pixels off-screen. getBoundingClientRect
+// forces a fresh layout, so this is always accurate -- and it only moves the
+// page when the card is actually out of view, so j/k stay still.
+function scrollCardIntoView(card) {
+  // innerHeight can be 0 in embedded/headless viewports; fall back rather
+  // than compute against a zero-height window
+  const vh = window.innerHeight || document.documentElement.clientHeight || 800;
+  const top = document.querySelector("header").offsetHeight + 8;
+  const bottom = vh - 8;
+  const r = card.getBoundingClientRect();
+  if (r.top < top || r.height > bottom - top) window.scrollBy(0, r.top - top);
+  else if (r.bottom > bottom) window.scrollBy(0, r.bottom - bottom);
 }
 
 function focusTo(i) {
   if (!view.length) return;
-  const clamped = Math.max(0, Math.min(i, view.length - 1));
-  if (clamped === focusIdx) return;  // j/k at the edges: a true no-op
-  focusIdx = clamped;
+  const c = Math.max(0, Math.min(i, view.length - 1));
+  if (c === focusIdx && cardAt(c)) return;  // j/k at the edges: a true no-op
+  focusIdx = c;
+  if (!cardAt(c)) {
+    // one step past the end is the common j-at-the-boundary case: extend.
+    // anything else is a jump (G, n, filter) -- re-anchor the window instead
+    // of rendering everything in between.
+    if (c === windowStart + rendered) appendChunk();
+    if (!cardAt(c)) renderWindow(Math.floor(c / PAGE) * PAGE);
+  }
   applyFocus(true);
 }
 
 function nextUndecided() {
   for (let s = 1; s <= view.length; s++) {
     const i = (focusIdx + s) % view.length;
-    if (state(view[i].key) === "undecided") {
-      focusIdx = i; applyFocus(true); return;
-    }
+    if (state(view[i].key) === "undecided") { focusTo(i); return; }
   }
 }
 
@@ -1822,12 +1974,9 @@ function toggleHelp() { document.getElementById("help").classList.toggle("show")
 // initial load. Everything else edits the standing DOM in place.
 function rebuild() {
   view = visibleTranches();
-  rendered = 0;
-  document.getElementById("list").textContent = "";
-  appendChunk();
   if (focusIdx >= view.length) focusIdx = Math.max(0, view.length - 1);
+  renderWindow(Math.floor(focusIdx / PAGE) * PAGE);
   applyFocus(true);
-  counts();
 }
 
 document.addEventListener("keydown", ev => {
@@ -1913,6 +2062,7 @@ document.getElementById("import").onchange = ev => {
   });
 };
 rebuild();
+if (carried) flash("loaded " + carried + " saved decision(s) from decisions.json");
 </script>
 </body>
 </html>
@@ -1938,12 +2088,21 @@ def load_decisions(path: Path, plan: dict, force_plan_key: bool) -> Dict[str, di
     obj = json.loads(path.read_text())
     if obj.get("version") != 1:
         raise SystemExit(f"{path}: unsupported decisions version {obj.get('version')!r}")
-    if obj.get("plan_key") != plan.get("plan_key") and not force_plan_key:
-        raise SystemExit(
-            f"{path} was exported for plan {obj.get('plan_key')!r} but this is "
-            f"plan {plan.get('plan_key')!r} -- the plan changed since review. "
-            "Re-review, or pass --force-plan-key if you know they match.")
-    return obj.get("decisions") or {}
+    decisions = obj.get("decisions") or {}
+    if obj.get("plan_key") != plan.get("plan_key"):
+        keys = {t["key"] for t in plan["tranches"]}
+        matched = sum(1 for k in decisions if k in keys)
+        msg = (f"{path} was exported for plan {obj.get('plan_key')!r}; this is "
+               f"plan {plan.get('plan_key')!r} (the library or the scan "
+               f"changed since). {matched:,} of {len(decisions):,} decision(s) "
+               "still name a tranche in this plan -- tranche ids are derived "
+               "from their members, so groups whose membership is unchanged "
+               "carry over; the rest need re-reviewing.")
+        if not force_plan_key:
+            raise SystemExit(msg + "\nRe-run with --force-plan-key to apply "
+                             "the ones that match.")
+        print("note: " + msg)
+    return decisions
 
 
 def approved_tranches(plan: dict, decisions: Dict[str, dict]
@@ -2546,6 +2705,29 @@ def selftest() -> None:
     assert format_rank("DNG") < format_rank("heic") < format_rank("png") \
         < format_rank("jpg") < format_rank("mov") < format_rank("xyz")
 
+    # keeper_reason names the rung that actually decided
+    big = _member("K1", "big.jpg", w=4000, h=3000, size=100)
+    small = _member("K2", "small.jpg", w=100, h=100, size=999)
+    assert "highest resolution (4000x3000)" == keeper_reason([big, small], "K1")
+    # the screenshot case: same pixels, same format, larger file wins
+    a = _member("K3", "a.jpg", w=1200, h=1600, size=324300)
+    b = _member("K4", "b.jpg", w=1200, h=1600, size=328294)
+    why = keeper_reason([a, b], "K4")
+    assert why.startswith("largest file (") and "resolution tied at 1200x1600" in why
+    # a few bytes apart: both render as the same KB, so say the delta instead
+    near = _member("K7", "e.jpg", w=1200, h=1600, size=b["size"] - 9)
+    why_near = keeper_reason([near, b], "K4")
+    assert "largest file by only 9 bytes" in why_near, why_near
+    assert " vs " not in why_near
+    heic = _member("K5", "c.heic", w=1200, h=1600, size=328294)
+    assert keeper_reason([b, heic], "K5").startswith("better format (.heic)")
+    twin = _member("K6", "d.jpg", w=1200, h=1600, size=328294)
+    assert "arbitrary" in keeper_reason([b, twin], "K4")
+    assert keeper_reason([b], "K4") == "only member"
+    # always explains whichever member choose_keeper actually returns
+    for group in ([big, small], [a, b], [b, heic], [b, twin]):
+        assert keeper_reason(group, choose_keeper(group))
+
     # merged date: oldest plausible across members and EXIF. A lone EXIF
     # date disagreeing with re-imported Photos dates is the NORMAL case the
     # merge fixes -- no spread warning for it.
@@ -2815,8 +2997,20 @@ def selftest() -> None:
     assert not _reveal_allowed(None, {good})
     for needle in ('case "j"', "/reveal?uuid=", "keydown", 'id="help"',
                    "setKeeper", "focusTo", 'id="helpbtn"', "/decisions",
-                   'id="status"', "downloadDecisions"):
+                   'id="status"', "downloadDecisions", "renderKeeperLine",
+                   "saved_decisions", "keeper_reason"):
         assert needle in REPORT_TEMPLATE, needle
+
+    # saved decisions carry across sessions; junk files degrade to {}
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        assert load_saved_decisions(tdp) == {}  # no file yet
+        (tdp / "decisions.json").write_text(json.dumps(
+            {"version": 1, "plan_key": "abc", "decisions": {"t1": {"d": "approved"}}}))
+        assert load_saved_decisions(tdp) == {"t1": {"d": "approved"}}
+        (tdp / "decisions.json").write_text("not json{")
+        assert load_saved_decisions(tdp) == {}
     assert _valid_decisions_payload({"version": 1, "decisions": {}})
     assert not _valid_decisions_payload({"version": 2, "decisions": {}})
     assert not _valid_decisions_payload({"version": 1, "decisions": []})
