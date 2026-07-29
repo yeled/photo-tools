@@ -173,8 +173,11 @@ and the final grouping pass always sees the whole set so no pair is
 missed); `--threads 4` caps czkawka's CPU instead, or combine both.
 
 The plan fixes what Apple's Merge button gets wrong: the **keeper** is chosen
-by resolution → file size → format (RAW > HEIC > PNG > JPEG) → UUID, never by
-date, and the **merged date** is the oldest *plausible* timestamp found
+by resolution → file size → format (RAW > HEIC > PNG > JPEG), and only when
+those are all identical (interchangeable copies, often byte-for-byte) by
+oldest timestamp → earliest import → UUID, so the original copy beats a
+re-import whose date drifted. A date never outranks image quality.
+The **merged date** is the oldest *plausible* timestamp found
 anywhere in the tranche (every member's Photos date plus its file's
 EXIF/QuickTime dates via exiftool; epoch placeholders, pre-1990 and future
 dates are excluded but shown). Same inputs, same answer, every time. The
