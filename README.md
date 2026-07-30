@@ -172,11 +172,15 @@ every hash is cached, so rerunning the scan resumes where you left off,
 and the final grouping pass always sees the whole set so no pair is
 missed); `--threads 4` caps czkawka's CPU instead, or combine both.
 
-The plan fixes what Apple's Merge button gets wrong: the **keeper** is chosen
-by resolution → file size → format (RAW > HEIC > PNG > JPEG), and only when
-those are all identical (interchangeable copies, often byte-for-byte) by
-oldest timestamp → earliest import → UUID, so the original copy beats a
-re-import whose date drifted. A date never outranks image quality.
+The plan fixes what Apple's Merge button gets wrong. The **keeper** is chosen
+by resolution → file size → format (RAW > HEIC > PNG > JPEG) → oldest
+timestamp → earliest import → shortest filename → UUID. Crucially, a size
+difference only counts when it is *material* — within `--size-tolerance-pct`
+(default 1%) two copies count as equal quality, because a handful of bytes of
+metadata padding on a multi-megabyte file says nothing about which is better.
+So the original beats a re-import whose date drifted, and `IMG_1234-2.tif`
+loses to `IMG_1234.tif`, while a genuinely larger or higher-resolution file
+still wins outright.
 The **merged date** is the oldest *plausible* timestamp found
 anywhere in the tranche (every member's Photos date plus its file's
 EXIF/QuickTime dates via exiftool; epoch placeholders, pre-1990 and future

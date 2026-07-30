@@ -26,12 +26,15 @@ afterwards. apply without --apply is a dry run.
 
 The merge plan fixes what Apple's own Merge button gets wrong:
 
-  * KEEPER (which pixels survive) is chosen by resolution, then file size,
-    then format (RAW > HEIC > PNG/TIFF > JPEG). A date never outranks
-    quality; only when those are all identical -- the copies are
-    interchangeable, often byte-for-byte -- does the oldest timestamp (then
-    the earliest import, then UUID) decide, so the original copy wins over a
-    re-import whose date drifted.
+  * KEEPER (which pixels survive) is chosen by resolution, then file size --
+    but only a MATERIAL size difference counts (outside --size-tolerance-pct,
+    default 1%), because a few bytes of metadata padding on a multi-megabyte
+    file says nothing about which copy is better. Copies within that band are
+    equal quality, so the ladder moves on to format (RAW > HEIC > PNG/TIFF >
+    JPEG), then the oldest timestamp, then the earliest import, then the
+    shortest filename (suffixes like "-2" mark copies and re-saves), then
+    UUID. So the original beats a re-import whose date drifted, while a
+    genuinely bigger or higher-resolution file still wins outright.
   * MERGED DATE is the OLDEST plausible timestamp found anywhere in the
     tranche: every member's Photos date plus its file's EXIF/QuickTime dates
     (DateTimeOriginal, CreateDate, CreationDate via exiftool). Implausible
@@ -137,6 +140,11 @@ DEFAULT_OUT = "dedupe-out"
 DEFAULT_NEAR = 10
 DEFAULT_MAX_WAL_GB = 2.0
 DEFAULT_MIN_PLAUSIBLE_YEAR = 1990
+# Two copies whose sizes are within this percentage of each other are treated
+# as equal quality, so the older one wins instead of the one with a few more
+# bytes of metadata padding. Scale matters, not absolute bytes: 1% of a 3 MB
+# TIFF is 30 KB, still far below a real difference in encoded detail.
+DEFAULT_SIZE_TOL_PCT = 1.0
 DEFAULT_SPREAD_WARN_DAYS = 2.0
 DEFAULT_THUMB_PX = 384
 
@@ -266,26 +274,44 @@ def oldest_plausible(m: dict, min_year: int, now: datetime) -> datetime:
     return min(cands) if cands else datetime.max
 
 
+def size_threshold(members: List[dict], size_tol_pct: float) -> float:
+    """Byte size at or above which a member counts as "as big as the best".
+
+    Measured against the largest file among the highest-resolution members,
+    minus the tolerance percentage -- so quality is judged on scale, not on
+    absolute bytes."""
+    max_pix = max((_pixels(m) for m in members), default=0)
+    best = max((m.get("size") or 0) for m in members if _pixels(m) == max_pix)
+    return best * (1.0 - size_tol_pct / 100.0)
+
+
 def choose_keeper(members: List[dict],
                   min_year: int = DEFAULT_MIN_PLAUSIBLE_YEAR,
-                  now: Optional[datetime] = None) -> str:
-    """Best pixels win: resolution desc, bytes desc, format rank asc.
+                  now: Optional[datetime] = None,
+                  size_tol_pct: float = DEFAULT_SIZE_TOL_PCT) -> str:
+    """Resolution first, then file size -- but size only counts when the
+    difference is MATERIAL (outside size_tol_pct of the biggest file). Copies
+    within that band are treated as equal quality, so the ladder moves on to
+    format, then the oldest timestamp, then the earliest import, then the
+    shortest filename (suffixes like "-2" mark copies and re-saves), with
+    UUID as the final deterministic backstop.
 
-    Only when those are ALL identical -- the copies are interchangeable as
-    pixels, often byte-for-byte -- does date decide: the member holding the
-    oldest timestamp, then the one imported first. That is the original copy
-    rather than a re-import whose date drifted, and keeping it means fewer
-    edits to apply. Dates still never outrank quality; they only replace what
-    used to be an arbitrary UUID coin-flip. UUID remains the final,
-    deterministic backstop."""
+    The tolerance is the point: a handful of bytes of EXIF padding on a
+    multi-megabyte file says nothing about which copy is better, so it must
+    not outrank an eleven-year-older capture date. Filename sits ABOVE import
+    date for the same reason -- import order inside one batch is bookkeeping
+    noise, while a "-2" suffix is real evidence of a copy."""
     now = now or datetime.now()
+    threshold = size_threshold(members, size_tol_pct)
 
     def key(m: dict):
         return (
-            -((m.get("width") or 0) * (m.get("height") or 0)),
-            -(m.get("size") or 0),
+            -_pixels(m),
+            0 if (m.get("size") or 0) >= threshold else 1,
             format_rank(m.get("ext") or ""),
             oldest_plausible(m, min_year, now),
+            len(m.get("filename") or ""),
+            (m.get("filename") or "").lower(),
             parse_iso(m.get("date_added")) or datetime.max,
             m["uuid"],
         )
@@ -298,7 +324,8 @@ def _pixels(m: dict) -> int:
 
 def keeper_reason(members: List[dict], keeper: str,
                   min_year: int = DEFAULT_MIN_PLAUSIBLE_YEAR,
-                  now: Optional[datetime] = None) -> str:
+                  now: Optional[datetime] = None,
+                  size_tol_pct: float = DEFAULT_SIZE_TOL_PCT) -> str:
     """Explain in one phrase which rule made this member the keeper.
 
     Mirrors choose_keeper's ladder exactly (resolution -> bytes -> format ->
@@ -310,52 +337,64 @@ def keeper_reason(members: List[dict], keeper: str,
     if k is None or not others:
         return "only member"
 
+    now = now or datetime.now()
     dims = f"{k.get('width') or '?'}x{k.get('height') or '?'}"
     kpix = _pixels(k)
-    best_other_pix = max(_pixels(m) for m in others)
-    if kpix > best_other_pix:
+    if kpix > max(_pixels(m) for m in others):
         return f"highest resolution ({dims})"
 
-    same_pix = [m for m in others if _pixels(m) == kpix]
+    # Each rung narrows the field to whoever survived the previous one, and
+    # the message says "of the N tied" rather than "identical" -- claiming all
+    # members matched on a rung they were already eliminated on was misleading.
+    threshold = size_threshold(members, size_tol_pct)
+    rivals = [m for m in others if _pixels(m) == kpix]
     ksize = k.get("size") or 0
-    best_other_size = max((m.get("size") or 0) for m in same_pix)
-    if ksize > best_other_size:
-        # rounded sizes often render identically (a few bytes of EXIF apart);
-        # show the delta then, so "largest file" never looks like a tie -- and
-        # so a keeper decided by a handful of bytes reads as the near-toss-up
-        # it really is
-        if hsize(ksize) == hsize(best_other_size):
-            return (f"largest file by only {ksize - best_other_size:,} bytes "
-                    f"({hsize(ksize)}) - resolution tied at {dims}")
-        return (f"largest file ({hsize(ksize)} vs {hsize(best_other_size)}) "
-                f"- resolution tied at {dims}")
+    if ksize >= threshold and any((m.get("size") or 0) < threshold
+                                  for m in rivals):
+        beaten = max((m.get("size") or 0) for m in rivals
+                     if (m.get("size") or 0) < threshold)
+        gap = f"{(ksize - beaten) / ksize * 100:.1f}%" if ksize else "?"
+        return (f"materially larger file ({hsize(ksize)} vs {hsize(beaten)}, "
+                f"{gap} bigger) - resolution tied at {dims}")
 
-    same_size = [m for m in same_pix if (m.get("size") or 0) == ksize]
-    krank = format_rank(k.get("ext") or "")
-    if krank < min(format_rank(m.get("ext") or "") for m in same_size):
-        return (f"better format (.{k.get('ext') or '?'}) - resolution and "
-                "file size tied")
+    def narrow(pool, fn):
+        best = min(fn(m) for m in pool + [k])
+        return [m for m in pool if fn(m) == best], fn(k) == best
 
-    # interchangeable as pixels: the oldest timestamp marks the original copy
-    now = now or datetime.now()
-    same_fmt = [m for m in same_size
-                if format_rank(m.get("ext") or "") == krank]
-    kdate = oldest_plausible(k, min_year, now)
-    if kdate < min(oldest_plausible(m, min_year, now) for m in same_fmt):
-        return (f"oldest timestamp ({iso(kdate)}) - identical resolution, "
-                "size and format, so the original copy wins")
+    rivals = [m for m in rivals if (m.get("size") or 0) >= threshold]
+    if not rivals:
+        return (f"largest file ({hsize(ksize)}) - resolution tied at {dims}")
 
-    same_date = [m for m in same_fmt
-                 if oldest_plausible(m, min_year, now) == kdate]
-    kadded = parse_iso(k.get("date_added")) or datetime.max
-    if kadded < min((parse_iso(m.get("date_added")) or datetime.max)
-                    for m in same_date):
-        return (f"imported first ({iso(kadded)}) - identical pixels and "
-                "timestamps")
+    rivals, kbest = narrow(rivals, lambda m: format_rank(m.get("ext") or ""))
+    if kbest and not rivals:
+        return (f"better format (.{k.get('ext') or '?'}) - resolution and file "
+                f"size within {size_tol_pct:g}%")
+    n = len(rivals) + 1
 
-    return ("identical resolution, size, format and dates - tie broken by "
-            "UUID, so this pick is arbitrary; choose by albums/keywords if "
-            "it matters")
+    rivals, kbest = narrow(rivals, lambda m: oldest_plausible(m, min_year, now))
+    if kbest and not rivals:
+        return (f"oldest timestamp ({iso(oldest_plausible(k, min_year, now))}) "
+                f"- of the {n} copies tied on pixels, size and format, so the "
+                "original wins")
+
+    # Suffixes like "-2" or a trailing " - 2006-09-23 18-54-00" mark copies
+    # and re-saves, so the shortest name is the closest thing to the original.
+    # This outranks import date: import order within one batch means nothing.
+    rivals, kbest = narrow(rivals, lambda m: len(m.get("filename") or ""))
+    if kbest and not rivals:
+        return (f"shortest filename ({k.get('filename')}) - of the {n} "
+                "otherwise identical; suffixed names like '-2' are usually "
+                "copies or edits")
+
+    rivals, kbest = narrow(
+        rivals, lambda m: parse_iso(m.get("date_added")) or datetime.max)
+    if kbest and not rivals:
+        return (f"imported first ({k.get('date_added')}) - of the {n} tied on "
+                "pixels, timestamps and filename")
+
+    return (f"{n} copies identical on pixels, size, format, dates and name "
+            "length - tie broken by name/UUID order, so this pick is "
+            "arbitrary; choose by albums/keywords if it matters")
 
 
 def date_candidates(member: dict) -> List[Tuple[str, datetime]]:
@@ -1203,7 +1242,8 @@ def load_czkawka(out_dir: Path, name: str) -> List[Dict[str, dict]]:
 
 def build_plan(scan: dict, dup_groups, image_groups, video_groups,
                min_year: int, spread_warn_days: float,
-               now: Optional[datetime] = None) -> dict:
+               now: Optional[datetime] = None,
+               size_tol_pct: float = DEFAULT_SIZE_TOL_PCT) -> dict:
     """Deterministic: no timestamps, stable ordering, so identical inputs
     produce byte-identical plan.json."""
     now = now or datetime.now()
@@ -1216,7 +1256,7 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
                                       dup_groups, image_groups, video_groups)
         m_date, source, spread, warnings = merged_date(
             ms, min_year, now, spread_warn_days)
-        keeper = choose_keeper(ms, min_year, now)
+        keeper = choose_keeper(ms, min_year, now, size_tol_pct)
         for m in ms:
             for flag in m["flags"]:
                 if flag in VISIBILITY_FLAGS:
@@ -1240,7 +1280,8 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
             "tier": tier,
             "czkawka_max_diff": max_diff,
             "keeper": keeper,
-            "keeper_reason": keeper_reason(ms, keeper, min_year, now),
+            "keeper_reason": keeper_reason(ms, keeper, min_year, now,
+                                           size_tol_pct),
             "merged_date": m_date,
             "date_source": source,
             "date_spread_days": spread,
@@ -1284,8 +1325,10 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
         "reader": scan["reader"],
         "generation": scan["generation"],
         "policy": {
-            "keeper": ("pixels desc, bytes desc, format rank, then (only on a "
-                       "full tie) oldest timestamp, earliest import, uuid"),
+            "keeper": (f"pixels desc, file size (ties within {size_tol_pct:g}% "
+                       "count as equal), format rank, oldest timestamp, "
+                       "shortest filename, earliest import, uuid"),
+            "size_tolerance_pct": size_tol_pct,
             "date": "oldest plausible candidate across tranche",
             "min_plausible_year": min_year,
             "date_spread_warn_days": spread_warn_days,
@@ -1338,7 +1381,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
     video_groups = load_czkawka(out_dir, "czkawka_video.json")
 
     plan = build_plan(scan, dup_groups, image_groups, video_groups,
-                      args.min_plausible_year, args.date_spread_warn_days)
+                      args.min_plausible_year, args.date_spread_warn_days,
+                      size_tol_pct=args.size_tolerance_pct)
     (out_dir / "plan.json").write_text(json.dumps(plan, indent=1, sort_keys=True))
     for kind in ("keepers", "losers"):
         (out_dir / f"{kind}.txt").write_text(
@@ -1686,9 +1730,9 @@ kbd { font: 12px ui-monospace, monospace; padding: 0 5px; border-radius: 4px;
 <tr><td><kbd>o</kbd></td><td>reveal keeper in Photos.app</td></tr>
 <tr><td><kbd>?</kbd></td><td>toggle this help</td></tr>
 <tr><td colspan="2" style="padding-top:8px;opacity:.75">
-keeper picked by: resolution → file size → format
-(RAW&gt;HEIC&gt;PNG&gt;JPEG); only on a full tie, oldest date → first
-imported → UUID. A date never outranks image quality.</td></tr>
+keeper: resolution → file size (differences under 1% count as
+equal) → format → oldest date → shortest filename → first
+imported → UUID.</td></tr>
 <tr><td colspan="2" style="opacity:.75">
 decisions autosave in this browser and reload from decisions.json</td></tr>
 </table></div>
@@ -2732,6 +2776,12 @@ def add_plan_args(p: argparse.ArgumentParser) -> None:
                    default=DEFAULT_SPREAD_WARN_DAYS, metavar="DAYS",
                    help="warn when a tranche's plausible dates span more "
                    f"(default {DEFAULT_SPREAD_WARN_DAYS:g})")
+    p.add_argument("--size-tolerance-pct", type=float,
+                   default=DEFAULT_SIZE_TOL_PCT, metavar="PCT",
+                   help="file sizes within this percentage of the biggest "
+                   "count as equal quality, so the oldest copy wins instead "
+                   f"of the one with a few more bytes (default "
+                   f"{DEFAULT_SIZE_TOL_PCT:g}; 0 compares exact bytes)")
 
 
 def add_review_args(p: argparse.ArgumentParser) -> None:
@@ -2807,6 +2857,8 @@ examples:
                        default=DEFAULT_MIN_PLAUSIBLE_YEAR)
     p_all.add_argument("--date-spread-warn-days", type=float,
                        default=DEFAULT_SPREAD_WARN_DAYS)
+    p_all.add_argument("--size-tolerance-pct", type=float,
+                       default=DEFAULT_SIZE_TOL_PCT)
     p_all.add_argument("--open", action="store_true")
     p_all.add_argument("--thumb-size", type=int, default=DEFAULT_THUMB_PX)
     p_all.add_argument("--skip-thumbs", action="store_true")
@@ -2894,16 +2946,21 @@ def selftest() -> None:
     assert is_suspect_date(datetime(2026, 7, 30), 1990, now)  # future
     assert not is_suspect_date(datetime(2026, 7, 29, 6, 0), 1990, now)  # <1d grace
 
-    # keeper policy: pixels, then bytes, then format, then uuid
+    # keeper policy: pixels, size (material differences only), format, dates,
+    # filename, uuid
     a = _member("B-BIG", "big.jpg", w=4000, h=3000, size=100)
     b = _member("A-SMALL", "small.jpg", w=100, h=100, size=999999)
     assert choose_keeper([a, b]) == "B-BIG"
     c = _member("C", "c.jpg", w=4000, h=3000, size=200)
-    assert choose_keeper([a, c]) == "C"  # same pixels, more bytes
+    assert choose_keeper([a, c]) == "C"  # same pixels, 100% more bytes
     d = _member("D", "d.heic", w=4000, h=3000, size=200)
     assert choose_keeper([c, d]) == "D"  # same pixels+bytes, heic beats jpg
     e = _member("A-TIE", "e.heic", w=4000, h=3000, size=200)
-    assert choose_keeper([d, e]) == "A-TIE"  # uuid tiebreak, stable
+    # filename order now decides before the uuid backstop: d.heic < e.heic
+    assert choose_keeper([d, e]) == "D"
+    # ...and with identical filenames, uuid is the final, stable backstop
+    e_same = _member("A-TIE", "d.heic", w=4000, h=3000, size=200)
+    assert choose_keeper([d, e_same]) == "A-TIE"
     assert format_rank("DNG") < format_rank("heic") < format_rank("png") \
         < format_rank("jpg") < format_rank("mov") < format_rank("xyz")
 
@@ -2914,18 +2971,40 @@ def selftest() -> None:
     # the screenshot case: same pixels, same format, larger file wins
     a = _member("K3", "a.jpg", w=1200, h=1600, size=324300)
     b = _member("K4", "b.jpg", w=1200, h=1600, size=328294)
-    why = keeper_reason([a, b], "K4")
-    assert why.startswith("largest file (") and "resolution tied at 1200x1600" in why
-    # a few bytes apart: both render as the same KB, so say the delta instead
-    near = _member("K7", "e.jpg", w=1200, h=1600, size=b["size"] - 9)
-    why_near = keeper_reason([near, b], "K4")
-    assert "largest file by only 9 bytes" in why_near, why_near
-    assert " vs " not in why_near
+    # 324300 vs 328294 is 1.2% apart -- a material difference, size still wins
+    assert choose_keeper([a, b], 1990, now) == "K4"
+    why = keeper_reason([a, b], "K4", 1990, now)
+    assert why.startswith("materially larger file (") and "1200x1600" in why, why
+
+    # A HANDFUL OF BYTES on a 320 KB file must NOT beat an older date: within
+    # tolerance the sizes count as equal, so the ladder falls through to date.
+    tiny_bigger = _member("AAA-NEWER", "e.jpg", w=1200, h=1600, size=328294,
+                          photos_date="2017-10-29T16:06:16")
+    older = _member("ZZZ-OLDER", "f.jpg", w=1200, h=1600, size=328294 - 9,
+                    photos_date="2006-09-23T09:54:00")
+    assert choose_keeper([tiny_bigger, older], 1990, now) == "ZZZ-OLDER"
+    why_old = keeper_reason([tiny_bigger, older], "ZZZ-OLDER", 1990, now)
+    assert why_old.startswith("oldest timestamp (2006-09-23T09:54:00)"), why_old
+    # ...and with the tolerance switched off, exact bytes win again
+    assert choose_keeper([tiny_bigger, older], 1990, now, 0.0) == "AAA-NEWER"
+
     heic = _member("K5", "c.heic", w=1200, h=1600, size=328294)
-    assert keeper_reason([b, heic], "K5").startswith("better format (.heic)")
+    assert keeper_reason([b, heic], "K5", 1990, now).startswith("better format (.heic)")
     twin = _member("K6", "d.jpg", w=1200, h=1600, size=328294)
-    assert "arbitrary" in keeper_reason([b, twin], "K4")
+    assert "arbitrary" in keeper_reason([b, twin], "K4", 1990, now)
     assert keeper_reason([b], "K4") == "only member"
+
+    # shortest filename beats a suffixed copy when all else ties
+    plain = _member("ZZZ-PLAIN", "london.tif", w=1476, h=1000, size=3145728,
+                    photos_date="2006-09-23T09:54:00")
+    suffixed = _member("AAA-COPY", "london-2.tif", w=1476, h=1000, size=3145728,
+                       photos_date="2006-09-23T09:54:00")
+    assert choose_keeper([suffixed, plain], 1990, now) == "ZZZ-PLAIN"
+    assert keeper_reason([suffixed, plain], "ZZZ-PLAIN", 1990, now
+                         ).startswith("shortest filename (london.tif)")
+    # size_threshold is measured against the biggest full-resolution member
+    assert size_threshold([plain, suffixed], 1.0) == 3145728 * 0.99
+    assert size_threshold([plain], 0.0) == 3145728
 
     # the real-world case: byte-identical copies, one a re-import whose date
     # drifted. The older one wins even though its UUID sorts LAST, so this
@@ -2948,8 +3027,8 @@ def selftest() -> None:
     bogus = _member("BOGUS", "z.jpg", w=1080, h=1920, size=143667,
                     photos_date="1970-01-01T00:00:00")
     assert choose_keeper([bogus, original], 1990, now) == "ZZZ-ORIGINAL"
-    # dates identical -> earliest import decides
-    same_date = _member("AAA-LATER", "w.jpg", w=1080, h=1920, size=143667,
+    # dates AND filename identical -> earliest import decides
+    same_date = _member("AAA-LATER", "x.jpg", w=1080, h=1920, size=143667,
                         photos_date="2024-12-18T21:21:58")
     same_date["date_added"] = "2026-01-01T00:00:00"
     assert choose_keeper([same_date, original], 1990, now) == "ZZZ-ORIGINAL"
