@@ -173,14 +173,21 @@ and the final grouping pass always sees the whole set so no pair is
 missed); `--threads 4` caps czkawka's CPU instead, or combine both.
 
 The plan fixes what Apple's Merge button gets wrong. The **keeper** is chosen
-by resolution → file size → format (RAW > HEIC > PNG > JPEG) → oldest
-timestamp → earliest import → shortest filename → UUID. Crucially, a size
-difference only counts when it is *material* — within `--size-tolerance-pct`
-(default 1%) two copies count as equal quality, because a handful of bytes of
-metadata padding on a multi-megabyte file says nothing about which is better.
-So the original beats a re-import whose date drifted, and `IMG_1234-2.tif`
-loses to `IMG_1234.tif`, while a genuinely larger or higher-resolution file
-still wins outright.
+by resolution → format (RAW > HEIC > PNG/TIFF > JPEG) → file size *within
+that format* → oldest timestamp → shortest filename → earliest import → UUID.
+
+Format outranks size because bytes only measure quality **within** one codec:
+HEVC is roughly 2× more efficient than JPEG, so the same picture as HEIC is
+about half the size — ranking by bytes keeps the JPEG export over the
+camera's own HEIC original, discarding 10-bit colour, depth maps and HDR gain
+maps for a derived 8-bit copy. A file below `--format-floor-pct` (default
+25%) of the biggest same-resolution file forfeits that advantage, so a
+degraded re-encode can't win on its extension alone. A size difference only
+counts when it is *material* — within `--size-tolerance-pct` (default 1%)
+two copies count as equal, because a few bytes of metadata padding on a
+multi-megabyte file says nothing about which is better. So the original beats
+a re-import whose date drifted, `IMG_1234-2.tif` loses to `IMG_1234.tif`, and
+a genuinely larger or higher-resolution file still wins outright.
 The **merged date** is the oldest *plausible* timestamp found
 anywhere in the tranche (every member's Photos date plus its file's
 EXIF/QuickTime dates via exiftool; epoch placeholders, pre-1990 and future

@@ -151,7 +151,7 @@ DEFAULT_SIZE_TOL_PCT = 1.0
 # is a degraded re-encode and forfeits its format advantage.
 DEFAULT_FORMAT_FLOOR_PCT = 25.0
 DEFAULT_SPREAD_WARN_DAYS = 2.0
-DEFAULT_THUMB_PX = 384
+DEFAULT_THUMB_PX = 768
 
 ISO_FMT = "%Y-%m-%dT%H:%M:%S"
 
@@ -1421,10 +1421,12 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
         "reader": scan["reader"],
         "generation": scan["generation"],
         "policy": {
-            "keeper": (f"pixels desc, file size (ties within {size_tol_pct:g}% "
-                       "count as equal), format rank, oldest timestamp, "
+            "keeper": ("pixels desc, format rank (RAW>HEIC>PNG/TIFF>JPEG), "
+                       f"file size within the surviving format (ties within "
+                       f"{size_tol_pct:g}% count as equal), oldest timestamp, "
                        "shortest filename, earliest import, uuid"),
             "size_tolerance_pct": size_tol_pct,
+            "format_floor_pct": DEFAULT_FORMAT_FLOOR_PCT,
             "date": "oldest plausible candidate across tranche",
             "min_plausible_year": min_year,
             "date_spread_warn_days": spread_warn_days,
@@ -1544,7 +1546,8 @@ def load_saved_decisions(out_dir: Path) -> Dict[str, dict]:
 
 
 def render_report(plan: dict, thumbs_ok: Set[str],
-                  saved: Optional[Dict[str, dict]] = None) -> str:
+                  saved: Optional[Dict[str, dict]] = None,
+                  thumb_rel: str = "thumbs") -> str:
     """Static review page. All member data reaches the DOM via textContent
     (never innerHTML), so filenames and titles cannot inject markup."""
     data = {
@@ -1561,6 +1564,7 @@ def render_report(plan: dict, thumbs_ok: Set[str],
             for u, m in plan["members"].items()
         },
         "thumbs": sorted(thumbs_ok),
+        "thumb_dir": thumb_rel,
         "saved_decisions": saved or {},
     }
     # <-escape every "<" so nothing in the data can ever terminate the
@@ -1707,7 +1711,10 @@ def cmd_review(args: argparse.Namespace) -> int:
     plan = json.loads(plan_path.read_text())
 
     report_dir = out_dir / "report"
-    thumbs_dir = report_dir / "thumbs"
+    # keyed by size: changing --thumb-size must not silently reuse thumbnails
+    # generated at the old size, and switching back stays instant
+    thumb_rel = f"thumbs-{args.thumb_size}"
+    thumbs_dir = report_dir / thumb_rel
     thumbs_dir.mkdir(parents=True, exist_ok=True)
 
     thumbs_ok: Set[str] = set()
@@ -1716,22 +1723,39 @@ def cmd_review(args: argparse.Namespace) -> int:
     if args.skip_thumbs:
         thumbs_ok = {u for u in wanted if (thumbs_dir / f"{u}.jpg").exists()}
     else:
-        print(f"thumbnails: {len(wanted):,} member(s)...")
-        for i, uuid in enumerate(wanted, start=1):
-            m = members[uuid]
-            if make_thumb(m.get("thumb_source") or m.get("path") or "",
-                          thumbs_dir / f"{uuid}.jpg",
-                          "video" in m.get("flags", []), args.thumb_size):
-                thumbs_ok.add(uuid)
-            if i % 500 == 0:
-                print(f"  {i:,}/{len(wanted):,}")
+        todo = [u for u in wanted if not (thumbs_dir / f"{u}.jpg").exists()]
+        thumbs_ok = set(wanted) - set(todo)   # NOT a per-item set() build
+        if todo:
+            # sips/ffmpeg are subprocesses, so threads parallelise fine
+            workers = args.thumb_workers or max(1, (os.cpu_count() or 4) - 2)
+            print(f"thumbnails: {len(todo):,} to generate at "
+                  f"{args.thumb_size}px on {workers} workers "
+                  f"({len(thumbs_ok):,} already cached)...")
+            from concurrent.futures import ThreadPoolExecutor
+
+            def one(uuid: str) -> Tuple[str, bool]:
+                m = members[uuid]
+                return uuid, make_thumb(
+                    m.get("thumb_source") or m.get("path") or "",
+                    thumbs_dir / f"{uuid}.jpg",
+                    "video" in m.get("flags", []), args.thumb_size)
+
+            done = 0
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for uuid, ok in pool.map(one, todo):
+                    done += 1
+                    if ok:
+                        thumbs_ok.add(uuid)
+                    if done % 2000 == 0:
+                        print(f"  {done:,}/{len(todo):,}")
 
     saved = load_saved_decisions(out_dir)
     if saved:
         print(f"carrying {len(saved):,} decision(s) forward from "
               f"{out_dir / 'decisions.json'}")
     index = report_dir / "index.html"
-    index.write_text(render_report(plan, thumbs_ok, saved), encoding="utf-8")
+    index.write_text(render_report(plan, thumbs_ok, saved, thumb_rel),
+                     encoding="utf-8")
     missing = len(wanted) - len(thumbs_ok)
     print(f"Wrote {index} ({len(plan['tranches']):,} tranche(s)"
           + (f", {missing:,} thumbnail(s) unavailable" if missing else "") + ")")
@@ -1783,14 +1807,14 @@ main { padding: 12px 16px 80px; max-width: 1300px; margin: 0 auto; }
 .keeperline .why { opacity: .8; }
 .keeperline .manual { color: #e8a020; }
 .members { display: flex; gap: 10px; overflow-x: auto; }
-.member { min-width: 230px; max-width: 300px; border: 1px solid
+.member { min-width: 400px; max-width: 560px; border: 1px solid
           color-mix(in srgb, CanvasText 15%, Canvas); border-radius: 8px;
           padding: 8px; }
 .member.keeper { border-color: #2e9e44; }
-.member img { max-width: 100%; max-height: 190px; display: block;
+.member img { max-width: 100%; max-height: 380px; display: block;
               margin: 0 auto 6px; border-radius: 4px; object-fit: contain; }
-.member .noimg { height: 100px; display: flex; align-items: center;
-                 justify-content: center; font-size: 32px; opacity: .4; }
+.member .noimg { height: 200px; display: flex; align-items: center;
+                 justify-content: center; font-size: 48px; opacity: .4; }
 .member .name { font-weight: 600; word-break: break-all; }
 .member table { border-collapse: collapse; margin-top: 4px; width: 100%; }
 .member td { padding: 0 6px 1px 0; vertical-align: top; font-size: 12px; }
@@ -1860,9 +1884,10 @@ kbd { font: 12px ui-monospace, monospace; padding: 0 5px; border-radius: 4px;
 <tr><td>exclude</td><td>drop one member: never deleted, never merged</td></tr>
 <tr><td><kbd>?</kbd></td><td>toggle this help</td></tr>
 <tr><td colspan="2" style="padding-top:8px;opacity:.75">
-keeper: resolution → file size (differences under 1% count as
-equal) → format → oldest date → shortest filename → first
-imported → UUID.</td></tr>
+keeper: resolution → format (RAW&gt;HEIC&gt;PNG&gt;JPEG) → file size
+within that format (differences under 1% count as equal) →
+oldest date → shortest filename → first imported → UUID.
+A smaller HEIC still wins: it is ~2x more efficient than JPEG.</td></tr>
 <tr><td colspan="2" style="opacity:.75">
 decisions autosave in this browser and reload from decisions.json</td></tr>
 </table></div>
@@ -2040,7 +2065,7 @@ function memberCard(t, uuid) {
   if (THUMBS.has(uuid)) {
     const img = document.createElement("img");
     img.loading = "lazy";
-    img.src = "thumbs/" + uuid + ".jpg";
+    img.src = (DATA.thumb_dir || "thumbs") + "/" + uuid + ".jpg";
     card.appendChild(img);
   } else {
     card.appendChild(el("div", "noimg",
@@ -2994,6 +3019,8 @@ def add_review_args(p: argparse.ArgumentParser) -> None:
                    help=f"thumbnail long edge in px (default {DEFAULT_THUMB_PX})")
     p.add_argument("--skip-thumbs", action="store_true",
                    help="reuse existing thumbnails only")
+    p.add_argument("--thumb-workers", type=int, default=0, metavar="N",
+                   help="parallel thumbnail workers (default: cores - 2)")
     p.add_argument("--serve", nargs="?", const=8942, type=int, default=None,
                    metavar="PORT",
                    help="serve the report on 127.0.0.1 (default port 8942) "
@@ -3064,6 +3091,7 @@ examples:
     p_all.add_argument("--open", action="store_true")
     p_all.add_argument("--thumb-size", type=int, default=DEFAULT_THUMB_PX)
     p_all.add_argument("--skip-thumbs", action="store_true")
+    p_all.add_argument("--thumb-workers", type=int, default=0)
     p_all.add_argument("--serve", nargs="?", const=8942, type=int, default=None,
                        metavar="PORT")
     return parser
