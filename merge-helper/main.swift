@@ -48,6 +48,11 @@ guard let manifestPath else {
 struct DateEdit: Decodable {
     let uuid: String
     let date: String
+    /// Seconds east of UTC at the CAPTURE location. `date` is wall-clock
+    /// time there, so this is what turns it into the right absolute instant.
+    /// Absent means "assume this Mac's current zone" (the old behaviour),
+    /// which is wrong whenever the photo was taken in another zone.
+    let utc_offset: Int?
 }
 struct Manifest: Decodable {
     var dates: [DateEdit]?
@@ -72,7 +77,14 @@ dateFormatter.timeZone = TimeZone.current
 var parsedDates: [(uuid: String, date: Date)] = []
 var badDates: [String] = []
 for edit in manifest.dates ?? [] {
-    if let d = dateFormatter.date(from: edit.date) {
+    // parse the wall clock in the photo's own zone, not this Mac's
+    let fmt = dateFormatter
+    if let off = edit.utc_offset, let tz = TimeZone(secondsFromGMT: off) {
+        fmt.timeZone = tz
+    } else {
+        fmt.timeZone = TimeZone.current
+    }
+    if let d = fmt.date(from: edit.date) {
         parsedDates.append((edit.uuid.uppercased(), d))
     } else {
         badDates.append("\(edit.uuid) \(edit.date)")

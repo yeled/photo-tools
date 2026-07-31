@@ -195,17 +195,27 @@ def parse_iso(text: Optional[str]) -> Optional[datetime]:
     return datetime.strptime(text, ISO_FMT) if text else None
 
 
-def core_data_to_local(value) -> Optional[datetime]:
-    """Core Data timestamp (seconds since 2001-01-01 UTC) -> naive local
-    datetime (the convention the rest of this repo speaks). 0/None -> None
-    (0 is Photos' own missing-date placeholder)."""
+def core_data_to_local(value, tz_offset: Optional[float] = None
+                       ) -> Optional[datetime]:
+    """Core Data timestamp (seconds since 2001-01-01 UTC) -> naive wall-clock
+    datetime AT THE CAPTURE LOCATION, using the asset's own stored UTC offset.
+
+    Not the machine's timezone: rendering a 2021 London photo on a laptop
+    currently in Paris used to add an hour, which made Photos dates disagree
+    with EXIF (a bare wall clock with no zone) by exactly that hour, and made
+    apply "correct" a difference that never existed. tz_offset=None keeps the
+    old machine-local behaviour for callers that have no offset to hand.
+
+    0/None -> None (0 is Photos' own missing-date placeholder)."""
     if value is None or value == 0:
         return None
     try:
         dt = CORE_DATA_EPOCH + timedelta(seconds=float(value))
     except (TypeError, ValueError, OverflowError):
         return None
-    return dt.astimezone().replace(tzinfo=None)
+    if tz_offset is None:
+        return dt.astimezone().replace(tzinfo=None)
+    return (dt + timedelta(seconds=float(tz_offset))).replace(tzinfo=None)
 
 
 def parse_exif_dt(text) -> Optional[datetime]:
@@ -845,11 +855,17 @@ def read_members_sqlite(conn: sqlite3.Connection, library: Path,
         sel("ZKINDSUBTYPE", "kindsubtype"), sel("ZAVALANCHEUUID", "burst_key"),
     ]
     join = ""
-    if "ZORIGINALFILENAME" in aaa_cols and "ZASSET" in aaa_cols:
-        parts.append("aaa.ZORIGINALFILENAME AS original_filename")
+    if "ZASSET" in aaa_cols:
         join = "LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK"
+        parts.append("aaa.ZORIGINALFILENAME AS original_filename"
+                     if "ZORIGINALFILENAME" in aaa_cols
+                     else "NULL AS original_filename")
+        # the capture-location UTC offset, so dates read as wall-clock there
+        parts.append("aaa.ZTIMEZONEOFFSET AS tz_offset"
+                     if "ZTIMEZONEOFFSET" in aaa_cols else "NULL AS tz_offset")
     else:
         parts.append("NULL AS original_filename")
+        parts.append("NULL AS tz_offset")
 
     members: Dict[str, dict] = {}
     rows = conn.execute(f"SELECT {', '.join(parts)} FROM ZASSET a {join}").fetchall()
@@ -887,8 +903,9 @@ def read_members_sqlite(conn: sqlite3.Connection, library: Path,
             "size": os.path.getsize(path) if path else None,
             "width": r["width"],
             "height": r["height"],
-            "photos_date": iso(core_data_to_local(r["created"])),
+            "photos_date": iso(core_data_to_local(r["created"], r["tz_offset"])),
             "date_added": iso(core_data_to_local(r["added"])),
+            "tz_offset": r["tz_offset"],
             "favorite": bool(r["favorite"]),
             "flags": flags,
             "burst_key": r["burst_key"],
@@ -908,9 +925,12 @@ def _photoinfo_lite(p) -> dict:
     """The cheap scalar fields of one PhotoInfo -- what the library-wide
     index holds. Albums/keywords/derivatives are enriched later, only for
     assets that end up in tranches."""
+    # osxphotos returns p.date tz-aware IN THE PHOTO'S OWN timezone, so drop
+    # the tzinfo to get capture-local wall clock. Converting to the machine's
+    # zone (.astimezone()) would shift every photo taken elsewhere.
     d = p.date
     if d is not None and d.tzinfo is not None:
-        d = d.astimezone().replace(tzinfo=None)
+        d = d.replace(tzinfo=None)
     added = p.date_added
     if added is not None and added.tzinfo is not None:
         added = added.astimezone().replace(tzinfo=None)
@@ -948,6 +968,7 @@ def _photoinfo_lite(p) -> dict:
         "height": p.height,
         "photos_date": iso(d),
         "date_added": iso(added),
+        "tz_offset": getattr(p, "tzoffset", None),
         "favorite": bool(p.favorite),
         "flags": flags,
         "burst_key": getattr(p, "burst_key", None),
@@ -2432,21 +2453,28 @@ def read_live_rows(conn: sqlite3.Connection, uuids: Iterable[str]
     over anything recorded at scan time."""
     rows: Dict[str, dict] = {}
     todo = sorted(set(uuids))
+    has_tz = "ZTIMEZONEOFFSET" in table_columns(conn, "ZADDITIONALASSETATTRIBUTES")
+    # same capture-local frame as the scan, or the comparison against
+    # merged_date invents a whole-hour difference and writes a wrong instant
+    tz_sel = "aaa.ZTIMEZONEOFFSET" if has_tz else "NULL"
     for i in range(0, len(todo), 800):
         chunk = todo[i:i + 800]
         marks = ",".join("?" * len(chunk))
         for r in conn.execute(
-                f"SELECT ZUUID, ZDATECREATED, ZFAVORITE, ZTRASHEDSTATE "
-                f"FROM ZASSET WHERE ZUUID IN ({marks})", chunk):
+                f"SELECT a.ZUUID, a.ZDATECREATED, a.ZFAVORITE, a.ZTRASHEDSTATE,"
+                f" {tz_sel} AS tz_offset FROM ZASSET a"
+                f" LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK"
+                f" WHERE a.ZUUID IN ({marks})", chunk):
             rows[_norm_uuid(r["ZUUID"])] = {
                 "exists": True,
                 "trashed": bool(r["ZTRASHEDSTATE"]),
-                "date": iso(core_data_to_local(r["ZDATECREATED"])),
+                "date": iso(core_data_to_local(r["ZDATECREATED"], r["tz_offset"])),
+                "tz_offset": r["tz_offset"],
                 "favorite": bool(r["ZFAVORITE"]),
             }
     for uuid in todo:
-        rows.setdefault(uuid, {"exists": False, "trashed": False,
-                               "date": None, "favorite": False})
+        rows.setdefault(uuid, {"exists": False, "trashed": False, "date": None,
+                               "tz_offset": None, "favorite": False})
     return rows
 
 
@@ -2494,8 +2522,12 @@ def build_apply_worklist(plan: dict, decisions: Dict[str, dict],
             rec["excluded"] = sorted(excluded)
 
         if t["merged_date"] and not _dt_close(live[keeper]["date"], t["merged_date"]):
+            # merged_date is capture-local wall clock; the keeper's own UTC
+            # offset turns it back into the right absolute instant. Without
+            # it merge-helper would assume the machine's current zone.
             work["dates"].append({"tranche": key, "uuid": keeper,
                                   "date": t["merged_date"],
+                                  "utc_offset": live[keeper].get("tz_offset"),
                                   "old_date": live[keeper]["date"]})
         if any(live[u]["favorite"] for u in members) \
                 and not live[keeper]["favorite"]:
@@ -2662,7 +2694,10 @@ def cmd_apply(args: argparse.Namespace) -> int:
 
     meta_manifest = out_dir / "apply-metadata.json"
     meta_manifest.write_text(json.dumps({
-        "dates": [{"uuid": e["uuid"], "date": e["date"]} for e in work["dates"]],
+        "dates": [{"uuid": e["uuid"], "date": e["date"],
+                   **({} if e.get("utc_offset") is None
+                      else {"utc_offset": int(e["utc_offset"])})}
+                  for e in work["dates"]],
         "favorites": [e["uuid"] for e in work["favorites"]],
     }, indent=1, sort_keys=True))
     del_manifest = out_dir / "apply-deletes.json"
@@ -3165,6 +3200,13 @@ def selftest() -> None:
     assert core_data_to_local(None) is None
     utc_probe = core_data_to_local(86400)
     assert utc_probe is not None and utc_probe.tzinfo is None
+    # a stored instant renders as wall clock AT THE CAPTURE LOCATION, so the
+    # machine's own zone cannot shift it. 643811597 = 2021-05-27 12:33:17 UTC
+    assert core_data_to_local(643811597, 3600) == datetime(2021, 5, 27, 13, 33, 17)
+    assert core_data_to_local(643811597, 0) == datetime(2021, 5, 27, 12, 33, 17)
+    assert core_data_to_local(643811597, 7200) == datetime(2021, 5, 27, 14, 33, 17)
+    assert core_data_to_local(643811597, -18000) == datetime(2021, 5, 27, 7, 33, 17)
+    assert core_data_to_local(0, 3600) is None
     assert iso(datetime(2020, 1, 2, 3, 4, 5)) == "2020-01-02T03:04:05"
     assert parse_iso("2020-01-02T03:04:05") == datetime(2020, 1, 2, 3, 4, 5)
     assert parse_iso(None) is None
@@ -3509,7 +3551,13 @@ def selftest() -> None:
     work2 = build_apply_worklist(plan_a, dec, live2)
     assert work2["dates"] == [{"tranche": k12, "uuid": "U1",
                                "date": "2019-06-02T14:11:03",
+                               "utc_offset": None,
                                "old_date": "2019-06-02T14:11:09"}]
+    # the keeper's own UTC offset rides along so the writer can rebuild the
+    # correct instant instead of assuming the machine's zone
+    live_tz = dict(live2)
+    live_tz["U1"] = dict(live2["U1"], tz_offset=3600)
+    assert build_apply_worklist(plan_a, dec, live_tz)["dates"][0]["utc_offset"] == 3600
     # within tolerance -> no write
     live3 = dict(live, U1={"exists": True, "trashed": False,
                            "date": "2019-06-02T14:11:04", "favorite": False})
