@@ -145,6 +145,11 @@ DEFAULT_MIN_PLAUSIBLE_YEAR = 1990
 # bytes of metadata padding. Scale matters, not absolute bytes: 1% of a 3 MB
 # TIFF is 30 KB, still far below a real difference in encoded detail.
 DEFAULT_SIZE_TOL_PCT = 1.0
+# A better format only wins if its file is at least this percentage of the
+# biggest same-resolution file. HEIC is ~2x more efficient than JPEG, so a
+# smaller HEIC is normal and must still win; but a file far below even that
+# is a degraded re-encode and forfeits its format advantage.
+DEFAULT_FORMAT_FLOOR_PCT = 25.0
 DEFAULT_SPREAD_WARN_DAYS = 2.0
 DEFAULT_THUMB_PX = 384
 
@@ -274,21 +279,48 @@ def oldest_plausible(m: dict, min_year: int, now: datetime) -> datetime:
     return min(cands) if cands else datetime.max
 
 
-def size_threshold(members: List[dict], size_tol_pct: float) -> float:
-    """Byte size at or above which a member counts as "as big as the best".
+def keeper_pool(members: List[dict], size_tol_pct: float,
+                format_floor_pct: float) -> Tuple[List[dict], str]:
+    """Narrow to the best-quality candidates, returning them and the rung
+    that last narrowed the field ("resolution", "format", "size", "" if the
+    group never narrowed).
 
-    Measured against the largest file among the highest-resolution members,
-    minus the tolerance percentage -- so quality is judged on scale, not on
-    absolute bytes."""
-    max_pix = max((_pixels(m) for m in members), default=0)
-    best = max((m.get("size") or 0) for m in members if _pixels(m) == max_pix)
-    return best * (1.0 - size_tol_pct / 100.0)
+    Order matters: FORMAT is judged before size, because bytes only measure
+    quality within one codec. HEIC is about twice as efficient as JPEG, so
+    the same picture is roughly half the size as HEIC -- comparing the two by
+    byte count picks the JPEG export over the camera's own original every
+    time. Size then compares like with like."""
+    pool, why = list(members), ""
+
+    best_pix = max(_pixels(m) for m in pool)
+    if any(_pixels(m) != best_pix for m in pool):
+        why = "resolution"
+    pool = [m for m in pool if _pixels(m) == best_pix]
+
+    floor = max((m.get("size") or 0) for m in pool) * format_floor_pct / 100.0
+
+    def rank(m: dict) -> int:
+        # a grossly small file is a degraded re-encode, not a better format
+        return (format_rank(m.get("ext") or "")
+                if (m.get("size") or 0) >= floor else 99)
+
+    best_rank = min(rank(m) for m in pool)
+    if any(rank(m) != best_rank for m in pool):
+        why = "format"
+    pool = [m for m in pool if rank(m) == best_rank]
+
+    threshold = max((m.get("size") or 0) for m in pool) * (1 - size_tol_pct / 100.0)
+    if any((m.get("size") or 0) < threshold for m in pool):
+        why = "size"
+    pool = [m for m in pool if (m.get("size") or 0) >= threshold]
+    return pool, why
 
 
 def choose_keeper(members: List[dict],
                   min_year: int = DEFAULT_MIN_PLAUSIBLE_YEAR,
                   now: Optional[datetime] = None,
-                  size_tol_pct: float = DEFAULT_SIZE_TOL_PCT) -> str:
+                  size_tol_pct: float = DEFAULT_SIZE_TOL_PCT,
+                  format_floor_pct: float = DEFAULT_FORMAT_FLOOR_PCT) -> str:
     """Resolution first, then file size -- but size only counts when the
     difference is MATERIAL (outside size_tol_pct of the biggest file). Copies
     within that band are treated as equal quality, so the ladder moves on to
@@ -302,20 +334,17 @@ def choose_keeper(members: List[dict],
     date for the same reason -- import order inside one batch is bookkeeping
     noise, while a "-2" suffix is real evidence of a copy."""
     now = now or datetime.now()
-    threshold = size_threshold(members, size_tol_pct)
+    pool, _ = keeper_pool(members, size_tol_pct, format_floor_pct)
 
     def key(m: dict):
         return (
-            -_pixels(m),
-            0 if (m.get("size") or 0) >= threshold else 1,
-            format_rank(m.get("ext") or ""),
             oldest_plausible(m, min_year, now),
             len(m.get("filename") or ""),
             (m.get("filename") or "").lower(),
             parse_iso(m.get("date_added")) or datetime.max,
             m["uuid"],
         )
-    return min(members, key=key)["uuid"]
+    return min(pool, key=key)["uuid"]
 
 
 def _pixels(m: dict) -> int:
@@ -325,7 +354,8 @@ def _pixels(m: dict) -> int:
 def keeper_reason(members: List[dict], keeper: str,
                   min_year: int = DEFAULT_MIN_PLAUSIBLE_YEAR,
                   now: Optional[datetime] = None,
-                  size_tol_pct: float = DEFAULT_SIZE_TOL_PCT) -> str:
+                  size_tol_pct: float = DEFAULT_SIZE_TOL_PCT,
+                  format_floor_pct: float = DEFAULT_FORMAT_FLOOR_PCT) -> str:
     """Explain in one phrase which rule made this member the keeper.
 
     Mirrors choose_keeper's ladder exactly (resolution -> bytes -> format ->
@@ -339,36 +369,39 @@ def keeper_reason(members: List[dict], keeper: str,
 
     now = now or datetime.now()
     dims = f"{k.get('width') or '?'}x{k.get('height') or '?'}"
-    kpix = _pixels(k)
-    if kpix > max(_pixels(m) for m in others):
-        return f"highest resolution ({dims})"
-
-    # Each rung narrows the field to whoever survived the previous one, and
-    # the message says "of the N tied" rather than "identical" -- claiming all
-    # members matched on a rung they were already eliminated on was misleading.
-    threshold = size_threshold(members, size_tol_pct)
-    rivals = [m for m in others if _pixels(m) == kpix]
     ksize = k.get("size") or 0
-    if ksize >= threshold and any((m.get("size") or 0) < threshold
-                                  for m in rivals):
-        beaten = max((m.get("size") or 0) for m in rivals
-                     if (m.get("size") or 0) < threshold)
+
+    # Mirrors keeper_pool's order exactly: resolution, then format, then size.
+    # Each message says "of the N tied" rather than "identical" -- claiming
+    # members matched on a rung they were already eliminated on was misleading.
+    pool, rung = keeper_pool(members, size_tol_pct, format_floor_pct)
+    if rung == "resolution":
+        return f"highest resolution ({dims})"
+    if rung == "format":
+        beaten = sorted({(m.get("ext") or "?") for m in members
+                         if m["uuid"] != k["uuid"]
+                         and format_rank(m.get("ext") or "") >
+                         format_rank(k.get("ext") or "")})
+        note = (" - a smaller HEIC is normal, it is ~2x more efficient"
+                if (k.get("ext") or "").lower() in ("heic", "heif") else "")
+        return (f"better format (.{k.get('ext') or '?'} over "
+                f"{', '.join('.' + e for e in beaten) or 'the rest'}) at the "
+                f"same {dims}{note}")
+    if rung == "size":
+        beaten = max((m.get("size") or 0) for m in members
+                     if (m.get("size") or 0) < min((x.get("size") or 0)
+                                                   for x in pool))
         gap = f"{(ksize - beaten) / ksize * 100:.1f}%" if ksize else "?"
         return (f"materially larger file ({hsize(ksize)} vs {hsize(beaten)}, "
-                f"{gap} bigger) - resolution tied at {dims}")
+                f"{gap} bigger) - same {dims} and format")
 
-    def narrow(pool, fn):
-        best = min(fn(m) for m in pool + [k])
-        return [m for m in pool if fn(m) == best], fn(k) == best
+    def narrow(pool_, fn):
+        best = min(fn(m) for m in pool_ + [k])
+        return [m for m in pool_ if fn(m) == best], fn(k) == best
 
-    rivals = [m for m in rivals if (m.get("size") or 0) >= threshold]
+    rivals = [m for m in pool if m["uuid"] != k["uuid"]]
     if not rivals:
-        return (f"largest file ({hsize(ksize)}) - resolution tied at {dims}")
-
-    rivals, kbest = narrow(rivals, lambda m: format_rank(m.get("ext") or ""))
-    if kbest and not rivals:
-        return (f"better format (.{k.get('ext') or '?'}) - resolution and file "
-                f"size within {size_tol_pct:g}%")
+        return f"best quality of the group ({dims}, {hsize(ksize)})"
     n = len(rivals) + 1
 
     rivals, kbest = narrow(rivals, lambda m: oldest_plausible(m, min_year, now))
@@ -3077,7 +3110,8 @@ def _member(uuid, filename="f.jpg", w=100, h=100, size=1000, ext=None,
             photos_date=None, exif=None, flags=(), burst_key=None) -> dict:
     return {
         "uuid": uuid, "filename": filename,
-        "ext": ext if ext is not None else filename.rsplit(".", 1)[-1],
+        # both readers lowercase the extension; mirror that here
+        "ext": (ext if ext is not None else filename.rsplit(".", 1)[-1]).lower(),
         "path": None, "thumb_source": None, "size": size,
         "width": w, "height": h, "photos_date": photos_date,
         "date_added": None, "favorite": False, "flags": list(flags),
@@ -3158,7 +3192,28 @@ def selftest() -> None:
     assert choose_keeper([tiny_bigger, older], 1990, now, 0.0) == "AAA-NEWER"
 
     heic = _member("K5", "c.heic", w=1200, h=1600, size=328294)
-    assert keeper_reason([b, heic], "K5", 1990, now).startswith("better format (.heic)")
+    assert keeper_reason([b, heic], "K5", 1990, now).startswith("better format (.heic")
+
+    # THE HEIC CASE: at the same resolution a HEIC is about half the bytes of
+    # the equivalent JPEG because HEVC is ~2x more efficient. Comparing the
+    # two by size picks the JPEG export over the camera's own original, so
+    # format is judged BEFORE size.
+    iphone_heic = _member("HEIC", "IMG_1.HEIC", w=3024, h=4032, size=1037846)
+    export_jpg = _member("JPG", "IMG_1.jpg", w=3024, h=4032, size=1656309)
+    assert choose_keeper([export_jpg, iphone_heic], 1990, now) == "HEIC"
+    why_h = keeper_reason([export_jpg, iphone_heic], "HEIC", 1990, now)
+    assert why_h.startswith("better format (.heic over .jpg)"), why_h
+    assert "2x more efficient" in why_h
+    # ...but a HEIC far below even that efficiency is a degraded re-encode
+    # and forfeits the format advantage (floor: 25% of the biggest)
+    thumb_heic = _member("TINY", "IMG_1.HEIC", w=3024, h=4032, size=200000)
+    assert choose_keeper([export_jpg, thumb_heic], 1990, now) == "JPG"
+    # within one codec size is still meaningful: the bigger JPEG wins
+    small_jpg = _member("J2", "IMG_2.jpg", w=3024, h=4032, size=1000000)
+    assert choose_keeper([small_jpg, export_jpg], 1990, now) == "JPG"
+    # RAW still outranks HEIC
+    dng = _member("DNG", "IMG_1.dng", w=3024, h=4032, size=900000)
+    assert choose_keeper([iphone_heic, dng], 1990, now) == "DNG"
     twin = _member("K6", "d.jpg", w=1200, h=1600, size=328294)
     assert "arbitrary" in keeper_reason([b, twin], "K4", 1990, now)
     assert keeper_reason([b], "K4") == "only member"
@@ -3171,9 +3226,11 @@ def selftest() -> None:
     assert choose_keeper([suffixed, plain], 1990, now) == "ZZZ-PLAIN"
     assert keeper_reason([suffixed, plain], "ZZZ-PLAIN", 1990, now
                          ).startswith("shortest filename (london.tif)")
-    # size_threshold is measured against the biggest full-resolution member
-    assert size_threshold([plain, suffixed], 1.0) == 3145728 * 0.99
-    assert size_threshold([plain], 0.0) == 3145728
+    # keeper_pool reports which rung last narrowed the field
+    assert keeper_pool([big, small], 1.0, 25.0)[1] == "resolution"
+    assert keeper_pool([export_jpg, iphone_heic], 1.0, 25.0)[1] == "format"
+    assert keeper_pool([a, b], 1.0, 25.0)[1] == "size"
+    assert keeper_pool([plain, suffixed], 1.0, 25.0)[1] == ""
 
     # the real-world case: byte-identical copies, one a re-import whose date
     # drifted. The older one wins even though its UUID sorts LAST, so this
