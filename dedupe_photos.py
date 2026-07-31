@@ -1946,7 +1946,7 @@ function trancheCard(t) {
   card.appendChild(kl);
   renderKeeperLine(t, kl);
   const row = el("div", "members");
-  t.members.forEach(u => row.appendChild(memberCard(t, u)));
+  displayOrder(t).forEach(u => row.appendChild(memberCard(t, u)));
   card.appendChild(row);
   const actions = el("div", "actions");
   const mk = (label, d) => {
@@ -2055,9 +2055,17 @@ function nextUndecided() {
   }
 }
 
+// The plan's chosen keeper always renders first, so the pick is where your
+// eye already is. Deliberately keyed on t.keeper, NOT the current selection:
+// re-sorting as you cycle with h/l would make the row shuffle under you.
+function displayOrder(t) {
+  return [t.keeper].concat(t.members.filter(u => u !== t.keeper));
+}
+
 function moveKeeper(t, delta) {
-  const i = t.members.indexOf(keeperOf(t));
-  setKeeper(t, t.members[(i + delta + t.members.length) % t.members.length]);
+  const order = displayOrder(t);
+  const i = order.indexOf(keeperOf(t));
+  setKeeper(t, order[(i + delta + order.length) % order.length]);
 }
 
 function toggleHelp() { document.getElementById("help").classList.toggle("show"); }
@@ -3314,7 +3322,7 @@ def selftest() -> None:
     for needle in ('case "j"', "/reveal?uuid=", "keydown", 'id="help"',
                    "setKeeper", "focusTo", 'id="helpbtn"', "/decisions",
                    'id="status"', "downloadDecisions", "renderKeeperLine",
-                   "saved_decisions", "keeper_reason"):
+                   "saved_decisions", "keeper_reason", "function displayOrder"):
         assert needle in REPORT_TEMPLATE, needle
 
     # saved decisions carry across sessions; junk files degrade to {}
