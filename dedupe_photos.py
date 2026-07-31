@@ -417,6 +417,19 @@ def sequential_filenames(names: Sequence[str]) -> bool:
     return len(stems) == 1 and len(set(nums)) == len(nums)
 
 
+def mixed_orientation(members: List[dict]) -> bool:
+    """True when the group mixes portrait and landscape. A duplicate keeps
+    its shape -- a crop or re-encode changes the ratio, not the orientation --
+    so this usually means the matcher pulled in something unrelated."""
+    seen = set()
+    for m in members:
+        w, h = m.get("width") or 0, m.get("height") or 0
+        if not w or not h:
+            return False
+        seen.add("portrait" if h > w else "landscape" if w > h else "square")
+    return len(seen - {"square"}) > 1
+
+
 def distinct_capture_times(members: List[dict], min_year: int,
                            now: datetime) -> bool:
     """True when every member has its own capture timestamp, spread over more
@@ -1314,6 +1327,8 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
                 warnings.append("sequential-filenames")
             if distinct_capture_times(ms, min_year, now):
                 warnings.append("distinct-capture-times")
+            if mixed_orientation(ms):
+                warnings.append("mixed-orientation")
         burst_keys = [m.get("burst_key") for m in ms if m.get("burst_key")]
         if len(burst_keys) >= 2 and len(set(burst_keys)) < len(ms):
             warnings.append("burst-mates")
@@ -1725,7 +1740,10 @@ footer.load { text-align: center; padding: 16px; }
 .card.focused { outline: 2px solid #4a90d9; outline-offset: 1px; }
 .member { cursor: pointer; }
 .member:hover { border-color: color-mix(in srgb, CanvasText 45%, Canvas); }
-.member .reveal { font-size: 12px; margin-left: 10px; }
+.member .reveal, .member .excl { font-size: 12px; margin-left: 8px; }
+.member.excluded { opacity: .38; border-style: dashed; }
+.member.excluded .name { text-decoration: line-through; }
+.member.excluded img { filter: grayscale(1); }
 #help { position: fixed; right: 16px; bottom: 16px; background: Canvas;
         border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas);
         border-radius: 10px; padding: 10px 14px; display: none; z-index: 3;
@@ -1776,6 +1794,7 @@ kbd { font: 12px ui-monospace, monospace; padding: 0 5px; border-radius: 4px;
 <tr><td><kbd>n</kbd></td><td>next undecided</td></tr>
 <tr><td><kbd>h</kbd> / <kbd>l</kbd></td><td>cycle keeper</td></tr>
 <tr><td><kbd>o</kbd></td><td>reveal keeper in Photos.app</td></tr>
+<tr><td>exclude</td><td>drop one member: never deleted, never merged</td></tr>
 <tr><td><kbd>?</kbd></td><td>toggle this help</td></tr>
 <tr><td colspan="2" style="padding-top:8px;opacity:.75">
 keeper: resolution → file size (differences under 1% count as
@@ -1837,8 +1856,36 @@ function visibleTranches() {
 // re-render, so nothing flickers. Cards that stop matching the filter stay
 // put until the next rebuild (filter change / import); that is deliberate,
 // it keeps the triage flow visually stable.
+// Members dropped from a tranche: not deleted, not merged into the keeper.
+// Lets a single false match be removed without discarding the whole group.
+const excludedOf = t => (dec[t.key] && dec[t.key].x) || [];
+
+function toggleExcluded(t, uuid) {
+  if (keeperOf(t) === uuid) return;          // the keeper can never be dropped
+  dec[t.key] = dec[t.key] || {};
+  const x = new Set(excludedOf(t));
+  x.has(uuid) ? x.delete(uuid) : x.add(uuid);
+  if (x.size) dec[t.key].x = [...x].sort(); else delete dec[t.key].x;
+  if (!Object.keys(dec[t.key]).length) delete dec[t.key];
+  save();
+  const card = document.querySelector('.card[data-key="' + t.key + '"]');
+  if (card) {
+    const m = card.querySelector('.member[data-uuid="' + uuid + '"]');
+    if (m) {
+      m.classList.toggle("excluded", x.has(uuid));
+      const b = m.querySelector(".excl");
+      if (b) b.textContent = x.has(uuid) ? "include" : "exclude";
+    }
+    const kl = card.querySelector(".keeperline");
+    if (kl) renderKeeperLine(t, kl);
+  }
+}
+
 function setKeeper(t, uuid) {
   if (keeperOf(t) === uuid) return;
+  // picking an excluded member as keeper implicitly brings it back
+  const x = new Set(excludedOf(t));
+  if (x.has(uuid)) toggleExcluded(t, uuid);
   dec[t.key] = dec[t.key] || {};
   dec[t.key].k = uuid;
   save();
@@ -1912,11 +1959,19 @@ function renderKeeperLine(t, kl) {
     kl.appendChild(el("span", "why",
       "  (default was " + name(t.keeper) + ": " + (t.keeper_reason || "") + ")"));
   }
+  const nx = excludedOf(t).length;
+  if (nx) {
+    kl.appendChild(el("span", "manual",
+      "  · " + nx + " excluded, " + (t.members.length - nx - 1) +
+      " to delete"));
+  }
 }
 
 function memberCard(t, uuid) {
   const m = DATA.members[uuid];
-  const card = el("div", "member" + (keeperOf(t) === uuid ? " keeper" : ""));
+  const isExcl = excludedOf(t).indexOf(uuid) !== -1;
+  const card = el("div", "member" + (keeperOf(t) === uuid ? " keeper" : "")
+                 + (isExcl ? " excluded" : ""));
   card.dataset.uuid = uuid;
   if (THUMBS.has(uuid)) {
     const img = document.createElement("img");
@@ -1967,6 +2022,12 @@ function memberCard(t, uuid) {
     btn.title = "Reveal in Photos.app";
     btn.onclick = ev => { ev.stopPropagation(); reveal(uuid); };
     card.appendChild(btn);
+  }
+  if (t.members.length > 2) {
+    const ex = el("button", "excl", isExcl ? "include" : "exclude");
+    ex.title = "Drop this one from the group: never deleted, never merged";
+    ex.onclick = ev => { ev.stopPropagation(); toggleExcluded(t, uuid); };
+    card.appendChild(ex);
   }
   card.onclick = () => setKeeper(t, uuid);  // the whole card picks the keeper
   return card;
@@ -2320,21 +2381,34 @@ def build_apply_worklist(plan: dict, decisions: Dict[str, dict],
         if any(w.startswith("unmergeable-member") for w in t["warnings"]):
             work["skipped"].append({"key": key, "reason": "unmergeable-member"})
             continue
-        gone = [u for u in t["members"]
+
+        # Members the reviewer excluded are dropped from the group entirely:
+        # not deleted, and their albums/keywords are NOT merged into the
+        # keeper. This is how a false match inside an otherwise-good tranche
+        # gets handled without throwing the whole tranche away.
+        excluded = set(( decisions.get(key) or {}).get("x") or [])
+        members = [u for u in t["members"] if u not in excluded]
+        if keeper in excluded or len(members) < 2:
+            work["skipped"].append({"key": key, "reason": "excluded-collapsed"})
+            continue
+
+        gone = [u for u in members
                 if not live[u]["exists"] or live[u]["trashed"]]
         if gone:
             work["skipped"].append({"key": key,
                                     "reason": f"member-gone:{','.join(gone)}"})
             continue
 
-        losers = [u for u in t["members"] if u != keeper]
+        losers = [u for u in members if u != keeper]
         rec = {"key": key, "id": t["id"], "keeper": keeper, "losers": losers}
+        if excluded:
+            rec["excluded"] = sorted(excluded)
 
         if t["merged_date"] and not _dt_close(live[keeper]["date"], t["merged_date"]):
             work["dates"].append({"tranche": key, "uuid": keeper,
                                   "date": t["merged_date"],
                                   "old_date": live[keeper]["date"]})
-        if any(live[u]["favorite"] for u in t["members"]) \
+        if any(live[u]["favorite"] for u in members) \
                 and not live[keeper]["favorite"]:
             work["favorites"].append({"tranche": key, "uuid": keeper})
 
@@ -2351,7 +2425,7 @@ def build_apply_worklist(plan: dict, decisions: Dict[str, dict],
                                        "album_title": adds[auuid],
                                        "uuid": keeper})
             union = sorted(set().union(
-                *(members_all[u].get("keywords") or [] for u in t["members"])))
+                *(members_all[u].get("keywords") or [] for u in members)))
             if union and set(union) != set(keeper_m.get("keywords") or []):
                 work["keywords"].append({"tranche": key, "uuid": keeper,
                                          "keywords": union})
@@ -2377,12 +2451,15 @@ def build_apply_worklist(plan: dict, decisions: Dict[str, dict],
     return work
 
 
-def verify_tranche(t: dict, keeper: str, live: Dict[str, dict]) -> str:
+def verify_tranche(t: dict, keeper: str, live: Dict[str, dict],
+                   excluded: Optional[Set[str]] = None) -> str:
     if not live[keeper]["exists"] or live[keeper]["trashed"]:
         return "keeper-missing"
     date_ok = (not t["merged_date"]
                or _dt_close(live[keeper]["date"], t["merged_date"]))
-    losers = [u for u in t["members"] if u != keeper]
+    # excluded members were never meant to go, so they must not read as pending
+    skip = excluded or set()
+    losers = [u for u in t["members"] if u != keeper and u not in skip]
     losers_gone = all(not live[u]["exists"] or live[u]["trashed"] for u in losers)
     if date_ok and losers_gone:
         return "complete"
@@ -2761,7 +2838,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     states: Dict[str, List[str]] = {}
     for t, keeper in approved:
-        states.setdefault(verify_tranche(t, keeper, live), []).append(t["key"])
+        excluded = set((decisions.get(t["key"]) or {}).get("x") or [])
+        states.setdefault(verify_tranche(t, keeper, live, excluded),
+                          []).append(t["key"])
     print(f"Verify: {len(approved):,} approved tranche(s)")
     for state in sorted(states):
         print(f"  {state:<15} {len(states[state]):,}")
@@ -3339,6 +3418,43 @@ def selftest() -> None:
     # rejected/undecided tranches are not selected at all
     assert build_apply_worklist(plan_a, {k12: {"d": "rejected"}}, live)["tranches"] == []
     assert build_apply_worklist(plan_a, {}, live)["tranches"] == []
+    # excluded members: not deleted, and their albums/keywords stay out
+    plan_x = json.loads(json.dumps(plan_a))
+    tx = next(t for t in plan_x["tranches"] if t["key"] == k12)
+    tx["members"] = ["U1", "U2", "U3"]
+    plan_x["members"]["U3"] = _member("U3", "intruder.jpg", w=200, h=200,
+                                      photos_date="2019-06-02T14:11:05")
+    plan_x["members"]["U3"]["album_uuids"] = [["AL-9", "Wrong"]]
+    live_x = dict(live, U3={"exists": True, "trashed": False,
+                            "date": "2019-06-02T14:11:05", "favorite": False})
+    wx = build_apply_worklist(plan_x, {k12: {"d": "approved", "x": ["U3"]}}, live_x)
+    assert [e["uuid"] for e in wx["deletes"]] == ["U2"], wx["deletes"]
+    assert wx["tranches"][0]["excluded"] == ["U3"]
+    assert "AL-9" not in [e["album_uuid"] for e in wx["albums"]]
+    # a vanished EXCLUDED member must not block the tranche
+    live_gone = dict(live_x, U3={"exists": False, "trashed": False,
+                                 "date": None, "favorite": False})
+    assert build_apply_worklist(
+        plan_x, {k12: {"d": "approved", "x": ["U3"]}}, live_gone)["tranches"]
+    # excluding everything but the keeper collapses the tranche
+    wc = build_apply_worklist(
+        plan_x, {k12: {"d": "approved", "x": ["U2", "U3"]}}, live_x)
+    assert wc["tranches"] == [] and wc["skipped"][0]["reason"] == "excluded-collapsed"
+    # verify ignores excluded members when judging completeness
+    assert verify_tranche(tx, "U1", live_x, {"U3"}) == "losers-pending"
+    live_done = dict(live_x, U2={"exists": False, "trashed": False,
+                                 "date": None, "favorite": False})
+    assert verify_tranche(tx, "U1", live_done, {"U3"}) == "complete"
+    assert verify_tranche(tx, "U1", live_done, set()) == "losers-pending"
+
+    # mixed orientation: a duplicate keeps its shape
+    port = _member("P", "p.mov", w=1080, h=1920)
+    land = _member("L", "l.mp4", w=640, h=352)
+    assert mixed_orientation([port, land])
+    assert not mixed_orientation([port, _member("P2", "p2.mov", w=1308, h=1744)])
+    assert not mixed_orientation([port, _member("N", "n.mov", w=0, h=0)])
+    assert not mixed_orientation([_member("S", "s.jpg", w=100, h=100), port])
+
     # skip_photoscript drops album/keyword/text work but keeps deletes
     work6 = build_apply_worklist(plan_a, dec, live, skip_photoscript=True)
     assert work6["albums"] == [] and work6["keywords"] == [] and work6["texts"] == []
