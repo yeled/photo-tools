@@ -1568,6 +1568,33 @@ def serve_report(out_dir: Path, report_dir: Path, port: int, allowed: Set[str],
         def log_message(self, *log_args):  # keep the terminal quiet
             pass
 
+        def _json(self, code: int, obj: dict) -> None:
+            """Reply with a JSON body and a STANDARD reason phrase.
+
+            Never put arbitrary text in the status line: it is encoded
+            latin-1, and AppleScript errors carry curly quotes, which raised
+            UnicodeEncodeError and killed the request thread. json.dumps
+            escapes non-ASCII, so the body is always safe."""
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def handle_one_request(self):
+            # a handler crash must not take the connection down with it
+            try:
+                super().handle_one_request()
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+            except Exception as err:
+                try:
+                    self._json(500, {"ok": False, "error": repr(err)[:300]})
+                except Exception:
+                    pass
+                self.close_connection = True
+
         def do_POST(self):
             if self.path != "/decisions":
                 self.send_error(404)
@@ -1606,20 +1633,23 @@ def serve_report(out_dir: Path, report_dir: Path, port: int, allowed: Set[str],
             query = urllib.parse.urlparse(self.path).query
             uuid = (urllib.parse.parse_qs(query).get("uuid") or [""])[0]
             if not _reveal_allowed(uuid, allowed):
-                self.send_error(403, "unknown uuid")
+                self._json(403, {"ok": False, "error": "unknown uuid"})
                 return
             script = ('tell application "Photos"\n  activate\n'
                       f'  spotlight media item id "{_norm_uuid(uuid)}"\n'
                       "end tell")
-            proc = subprocess.run(["osascript", "-e", script],
-                                  capture_output=True, text=True, timeout=15)
+            try:
+                proc = subprocess.run(["osascript", "-e", script],
+                                      capture_output=True, text=True, timeout=20)
+            except subprocess.TimeoutExpired:
+                self._json(504, {"ok": False, "error": "Photos did not respond"})
+                return
             if proc.returncode == 0:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"ok": true}')
+                self._json(200, {"ok": True})
             else:
-                self.send_error(502, proc.stderr.strip()[:200] or "osascript failed")
+                self._json(502, {"ok": False,
+                                 "error": (proc.stderr or "").strip()[:300]
+                                 or "osascript failed"})
 
     handler = partial(Handler, directory=str(report_dir))
     with http.server.ThreadingHTTPServer(("127.0.0.1", port), handler) as httpd:
@@ -1925,8 +1955,9 @@ function decide(key, d, advance) {
 function reveal(uuid) {
   if (!REVEAL) return;
   fetch("/reveal?uuid=" + encodeURIComponent(uuid))
-    .then(r => { if (!r.ok) throw 0; })
-    .catch(() => alert("reveal failed -- is the review server still running?"));
+    .then(r => r.json().then(j => ({ok: r.ok, j})))
+    .then(({ok, j}) => { if (!ok) flash("reveal failed: " + (j.error || "?")); })
+    .catch(() => flash("reveal failed -- is the review server still running?"));
 }
 
 function el(tag, cls, text) {
@@ -3486,6 +3517,19 @@ def selftest() -> None:
     assert not _reveal_allowed('"; do shell script "x"; "', {good})
     assert not _reveal_allowed("", {""})
     assert not _reveal_allowed(None, {good})
+    # HTTP status lines are encoded latin-1, and AppleScript errors carry
+    # curly quotes ("Can't get media item..."), which raised
+    # UnicodeEncodeError and killed the request thread when passed as a
+    # reason phrase. Detail must travel in a JSON body, which json.dumps
+    # keeps ASCII-only, so it is always encodable.
+    curly = "Photos got an error: Can’t get media item id “x”"
+    assert json.dumps({"error": curly}).encode().decode("latin-1")
+    try:
+        curly.encode("latin-1")
+    except UnicodeEncodeError:
+        pass
+    else:
+        raise AssertionError("expected the raw message to be latin-1 hostile")
     for needle in ('case "j"', "/reveal?uuid=", "keydown", 'id="help"',
                    "setKeeper", "focusTo", 'id="helpbtn"', "/decisions",
                    'id="status"', "downloadDecisions", "renderKeeperLine",
