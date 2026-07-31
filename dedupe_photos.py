@@ -397,6 +397,42 @@ def keeper_reason(members: List[dict], keeper: str,
             "arbitrary; choose by albums/keywords if it matters")
 
 
+_SEQ_RE = re.compile(r"^(.*?)(\d+)(\D*)$")
+
+
+def sequential_filenames(names: Sequence[str]) -> bool:
+    """True when the names differ only by a running number (GRMN1639,
+    GRMN1640, ...). Cameras number consecutive captures that way, so a
+    "duplicate" group of them is far more likely to be a SERIES than copies
+    -- true copies repeat a name or add a "-2" suffix."""
+    if len(names) < 3:
+        return False
+    stems, nums = set(), []
+    for name in names:
+        m = _SEQ_RE.match(os.path.splitext(name)[0])
+        if not m:
+            return False
+        stems.add((m.group(1).lower(), m.group(3).lower()))
+        nums.append(int(m.group(2)))
+    return len(stems) == 1 and len(set(nums)) == len(nums)
+
+
+def distinct_capture_times(members: List[dict], min_year: int,
+                           now: datetime) -> bool:
+    """True when every member has its own capture timestamp, spread over more
+    than a couple of seconds. Genuine duplicates share a capture time (it is
+    the same moment); a set of consecutive recordings does not.
+
+    Needs THREE or more members: a pair with differing timestamps is the
+    everyday re-import, which this tool exists to fix silently, not warn
+    about. Three copies each stamped a different moment is a series."""
+    times = [oldest_plausible(m, min_year, now) for m in members]
+    if len(times) < 3 or any(t == datetime.max for t in times):
+        return False
+    return (len(set(times)) == len(times)
+            and (max(times) - min(times)).total_seconds() > 2)
+
+
 def date_candidates(member: dict) -> List[Tuple[str, datetime]]:
     """(label, naive local datetime) for every timestamp this member offers,
     deterministic order."""
@@ -1266,6 +1302,18 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
         kinds = {"video" if "video" in m["flags"] else "photo" for m in ms}
         if len(kinds) > 1:
             warnings.append("mixed-media")
+        # A group whose members are consecutively numbered AND each carry
+        # their own capture time is almost certainly a series of separate
+        # shots -- a static camera makes their frames match, but they are not
+        # duplicates. Loudly flagged, and never auto-suggested.
+        # ...unless the files are byte-identical, where "different captures"
+        # is impossible by definition and the differing dates are just
+        # re-import bookkeeping.
+        if tier != "exact":
+            if sequential_filenames([m.get("filename") or "" for m in ms]):
+                warnings.append("sequential-filenames")
+            if distinct_capture_times(ms, min_year, now):
+                warnings.append("distinct-capture-times")
         burst_keys = [m.get("burst_key") for m in ms if m.get("burst_key")]
         if len(burst_keys) >= 2 and len(set(burst_keys)) < len(ms):
             warnings.append("burst-mates")
@@ -1814,9 +1862,12 @@ function syncCard(card) {
 
 function decide(key, d, advance) {
   dec[key] = dec[key] || {};
-  if (d === null || (dec[key].d === d && !advance)) delete dec[key].d;
-  else dec[key].d = d;
-  if (!Object.keys(dec[key]).length) delete dec[key];
+  // Clearing writes an explicit "undecided" TOMBSTONE rather than deleting
+  // the entry. Deleting it made the decision look like one never made, so
+  // the carry-forward from decisions.json silently resurrected the old
+  // answer on the next load -- a rejection could revert to approved.
+  const cleared = (d === null || (dec[key].d === d && !advance));
+  dec[key].d = cleared ? "undecided" : d;
   save();
   const card = document.querySelector('.card[data-key="' + key + '"]');
   if (card) syncCard(card);
@@ -2116,8 +2167,8 @@ document.getElementById("approve-shown").onclick = () => {
   counts();
 };
 document.getElementById("clear-shown").onclick = () => {
-  view.forEach(t => { if (dec[t.key]) { delete dec[t.key].d;
-    if (!Object.keys(dec[t.key]).length) delete dec[t.key]; } });
+  view.forEach(t => { dec[t.key] = dec[t.key] || {};
+    dec[t.key].d = "undecided"; });   // tombstone, see decide()
   save();
   [...document.getElementById("list").children].forEach(syncCard);
   counts();
@@ -3341,6 +3392,41 @@ def selftest() -> None:
     assert not _valid_decisions_payload({"version": 1})
     assert not _valid_decisions_payload([])
     assert not _valid_decisions_payload(None)
+
+    # false-positive guards: a static camera makes consecutive clips look
+    # alike to a frame hasher, but they are a series, not duplicates
+    grmn = [f"GRMN{n}.MP4" for n in range(1639, 1652)]
+    assert sequential_filenames(grmn)
+    assert sequential_filenames(["IMG_1001.jpg", "IMG_1002.jpg", "IMG_1003.jpg"])
+    assert not sequential_filenames(["a.jpg", "a-2.jpg"])          # too few
+    assert not sequential_filenames(["a.jpg", "a-2.jpg", "a-3.jpg"])  # same stem "a-"
+    assert not sequential_filenames(["IMG_1.jpg", "DSC_2.jpg", "PIC_3.jpg"])
+    assert not sequential_filenames(["x1.jpg", "x1.jpg", "x1.jpg"])  # repeats
+    assert not sequential_filenames([])
+
+    seq = [_member(f"U{i}", f"GRMN{1639+i}.MP4",
+                   photos_date=f"2026-06-26T08:5{i}:03") for i in range(4)]
+    assert distinct_capture_times(seq, 1990, now)
+    same_moment = [_member(x, f"{x}.jpg", photos_date="2020-01-01T00:00:00")
+                   for x in "ABC"]
+    assert not distinct_capture_times(same_moment, 1990, now)  # true duplicates
+    # a PAIR with differing dates is an ordinary re-import, not a series
+    pair = [_member("A", "a.jpg", photos_date="2019-06-02T14:11:03"),
+            _member("B", "b.jpg", photos_date="2021-01-01T00:00:00")]
+    assert not distinct_capture_times(pair, 1990, now)
+    assert not distinct_capture_times(
+        [_member("A", "a.jpg"), _member("B", "b.jpg")], 1990, now)  # no dates
+
+    scan_seq = {
+        **scan,
+        "apple_tranches": build_apple_tranches(
+            [(f"U{i}", 7, None) for i in range(4)]),
+        "members": {f"U{i}": seq[i] for i in range(4)},
+    }
+    plan_seq = build_plan(scan_seq, [], [], [], 1990, 2.0, now=now)
+    wseq = plan_seq["tranches"][0]["warnings"]
+    assert "sequential-filenames" in wseq and "distinct-capture-times" in wseq
+    assert not plan_seq["tranches"][0]["suggested"]
 
     # burst + mixed-media warnings
     scan2 = {
