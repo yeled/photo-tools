@@ -4,3 +4,4 @@ __pycache__/
 flatten-photos/flatten-photos
 merge-helper/merge-helper
 dedupe-out/
+merge-helper/_CodeSignature/
