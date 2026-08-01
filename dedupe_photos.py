@@ -35,6 +35,15 @@ The merge plan fixes what Apple's own Merge button gets wrong:
     shortest filename (suffixes like "-2" mark copies and re-saves), then
     UUID. So the original beats a re-import whose date drifted, while a
     genuinely bigger or higher-resolution file still wins outright.
+  * ALL DATES ARE WALL CLOCK AT THE CAPTURE LOCATION, never the machine's
+    current zone. Photos stores an absolute instant plus the capture UTC
+    offset; EXIF stores a bare wall clock with no zone at all. Rendering the
+    former in the machine's zone made the two disagree by exactly the
+    travel offset (a London photo read an hour late on a laptop in Paris),
+    which made apply "fix" a difference that never existed and write the
+    wrong instant. Dates that get written carry the asset's own offset so
+    merge-helper rebuilds the correct instant.
+
   * MERGED DATE is the OLDEST plausible timestamp found anywhere in the
     tranche: every member's Photos date plus its file's EXIF/QuickTime dates
     (DateTimeOriginal, CreateDate, CreationDate via exiftool). Implausible

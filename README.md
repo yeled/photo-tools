@@ -188,6 +188,12 @@ two copies count as equal, because a few bytes of metadata padding on a
 multi-megabyte file says nothing about which is better. So the original beats
 a re-import whose date drifted, `IMG_1234-2.tif` loses to `IMG_1234.tif`, and
 a genuinely larger or higher-resolution file still wins outright.
+**All dates are wall clock at the capture location**, not the machine's
+current timezone — Photos stores an instant plus the capture UTC offset while
+EXIF stores a bare wall clock, so rendering Photos dates locally made the two
+disagree by the travel offset and caused spurious "corrections". Written dates
+carry the asset's own offset so the correct instant is restored.
+
 The **merged date** is the oldest *plausible* timestamp found
 anywhere in the tranche (every member's Photos date plus its file's
 EXIF/QuickTime dates via exiftool; epoch placeholders, pre-1990 and future
