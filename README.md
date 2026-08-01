@@ -209,10 +209,16 @@ EXIF stores a bare wall clock, so rendering Photos dates locally made the two
 disagree by the travel offset and caused spurious "corrections". Written dates
 carry the asset's own offset so the correct instant is restored.
 
-The **merged date** is the oldest *plausible* timestamp found
-anywhere in the tranche (every member's Photos date plus its file's
-EXIF/QuickTime dates via exiftool; epoch placeholders, pre-1990 and future
-dates are excluded but shown). Same inputs, same answer, every time. The
+The **merged date** is the oldest *plausible* timestamp found anywhere in the
+tranche. Candidates are every member's Photos date, its file's EXIF/QuickTime
+dates via exiftool, and **any timestamp embedded in the filename** —
+`webcam23 - 2004-02-22 18-07-14.jpg` is capture metadata that survives
+re-imports which trash the Photos date. 13% of this library's filenames carry
+one, and they agree with EXIF exactly 76% of the time; where they disagree the
+oldest-plausible rule sorts it out, so a Flickr export stamp loses to older
+EXIF while a filename rescues a tranche whose EXIF reads 2017 for a 2006
+shoot. Epoch placeholders, pre-1990 and future dates are excluded but shown.
+Same inputs, same answer, every time. The
 `date-spread` warning fires only when **EXIF/QuickTime candidates disagree
 with each other** — duplicates re-imported on different days routinely carry
 different Photos dates, and silently fixing that is the tool's job, not a

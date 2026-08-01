@@ -520,6 +520,36 @@ def distinct_capture_times(members: List[dict], min_year: int,
             and (max(times) - min(times)).total_seconds() > 2)
 
 
+# "webcam23 - 2004-02-22 18-07-14.jpg", "IMG_20240101_120000.jpg",
+# "Screenshot 2024-01-01 at 12.00.00.png". A TIME component is required:
+# a bare date in a filename is far more often an album or batch label.
+# Each field is range-constrained rather than a bare \d{2}: a loose pattern
+# matched "45460012 - 2004-06" as 4546-00-12T20:04:06, and because the scan
+# is non-overlapping that consumed the real timestamp right after it.
+_FN_DT_RE = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-9]|[12]\d|3[01])"
+    r"[ T_.-]+(?:at[ ])?"
+    r"([01]\d|2[0-3])[-_.:]?([0-5]\d)[-_.:]?([0-5]\d)(?!\d)")
+
+
+def filename_datetime(name: Optional[str]) -> Optional[datetime]:
+    """The timestamp embedded in a filename, if there is a real one.
+
+    Whatever export wrote "name - 2004-02-22 18-07-14.jpg" knew the true
+    capture time, and it survives re-imports that trash the Photos date --
+    so it is worth trusting as a candidate. Anything that does not form a
+    valid datetime (a serial number that looks date-shaped, month 00) is
+    rejected rather than guessed at."""
+    if not isinstance(name, str):
+        return None
+    for m in _FN_DT_RE.finditer(os.path.splitext(name)[0]):
+        try:
+            return datetime(*(int(g) for g in m.groups()))
+        except ValueError:
+            continue  # 4546-00-12 and friends: not a date, keep looking
+    return None
+
+
 def date_candidates(member: dict) -> List[Tuple[str, datetime]]:
     """(label, naive local datetime) for every timestamp this member offers,
     deterministic order."""
@@ -534,6 +564,14 @@ def date_candidates(member: dict) -> List[Tuple[str, datetime]]:
         dt = parse_exif_dt(exif.get(key))
         if dt:
             out.append((label, dt))
+    # A timestamp written into the filename by some past export is capture
+    # metadata too, and it survives re-imports that trash the Photos date.
+    # It is not always right (a Flickr export stamps its own date), but the
+    # oldest-plausible rule sorts that out: where EXIF is older, EXIF wins;
+    # where EXIF is nonsense, the filename rescues the tranche.
+    fdt = filename_datetime(member.get("filename"))
+    if fdt:
+        out.append(("filename", fdt))
     return out
 
 
@@ -3496,6 +3534,38 @@ def selftest() -> None:
     _tz_independence_selftest()
 
     # datetime plumbing
+    # timestamps embedded in filenames by past exports, from this library
+    assert filename_datetime("webcam23 - 2004-02-22 18-07-14.jpg") == \
+        datetime(2004, 2, 22, 18, 7, 14)
+    assert filename_datetime("107-0762_IMG - 2002-11-19 07-38-02.JPG") == \
+        datetime(2002, 11, 19, 7, 38, 2)
+    assert filename_datetime("IMG_0713 - 2009-12-22 16-13-28 (1).JPG") == \
+        datetime(2009, 12, 22, 16, 13, 28)
+    assert filename_datetime("WhatsApp Image 2020-10-23 at 10.32.26.jpeg") == \
+        datetime(2020, 10, 23, 10, 32, 26)
+    assert filename_datetime("IMG_20240101_120000.jpg") == \
+        datetime(2024, 1, 1, 12, 0, 0)
+    assert filename_datetime("2013-09-14 09.55.32.tif") == \
+        datetime(2013, 9, 14, 9, 55, 32)
+    # a serial that merely looks date-shaped must not become a date; the real
+    # timestamp later in the same name still does
+    assert filename_datetime("45460012 - 2004-06-05 16-15-45-2.jpg") == \
+        datetime(2004, 6, 5, 16, 15, 45)
+    for junk in ("IMG_1234.jpg", "2004-02-22.jpg", "DSC00001.JPG", "", None,
+                 "99999999_999999.jpg", "2004-13-45 99-99-99.jpg"):
+        assert filename_datetime(junk) is None, junk
+    # and it reaches the candidate list
+    fnm = _member("F", "webcam23 - 2004-02-22 18-07-14.jpg",
+                  photos_date="2025-12-24T19:31:54")
+    assert ("filename", datetime(2004, 2, 22, 18, 7, 14)) in date_candidates(fnm)
+    dt_fn, src_fn, _, _ = merged_date([fnm], 1990, now, 2.0)
+    assert dt_fn == "2004-02-22T18:07:14", dt_fn
+    assert src_fn.startswith("filename:"), src_fn
+    # ...but an older EXIF still wins over an export-stamped filename
+    flickr = _member("K", "66924811_o - 2011-01-11 11-13-16.jpg",
+                     exif={"DateTimeOriginal": "2003-12-25T15:29:07"})
+    assert merged_date([flickr], 1990, now, 2.0)[0] == "2003-12-25T15:29:07"
+
     assert parse_exif_dt("2016-08-19T09:12:44") == datetime(2016, 8, 19, 9, 12, 44)
     assert parse_exif_dt("2016:08:19 09:12:44") == datetime(2016, 8, 19, 9, 12, 44)
     off = parse_exif_dt("2016-08-19T09:12:44+00:00")
