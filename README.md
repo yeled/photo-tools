@@ -228,7 +228,23 @@ reason for scrutiny.
 every date candidate (implausible ones struck through), czkawka verification
 tier per tranche (`exact` / `visual-0` / `near` / `video` / `partial` /
 `unverified` — the last two are Apple-only claims czkawka could not confirm,
-so look closely). Approve/reject per tranche or in bulk, click anywhere on a
+so look closely).
+
+Every tier asks whether evidence of **its own kind** links the whole tranche
+into one connected piece. A perceptual distance describes the stills it was
+measured between, so a member reached only by a video match cannot inherit
+one — such a tranche caps at `video`. Two verified pairs bridged by a single
+edge of a different kind are `partial`, not one verified group: copies of one
+photo all land in a single czkawka group, so two disjoint groups mean czkawka
+sees two different photos. This matters most for Live Photos, whose ~2-second
+motion clips are hashed too: a clip-to-clip match between two Live Photos is
+never on its own reason to call them the same photo (czkawka's video hash is
+unreliable at that length), so it no longer groups them, and
+`--video-tolerance` defaults to 5 rather than czkawka's 10. A clip matching a
+**standalone video** still counts — there the match rests on a file the asset
+actually shows.
+
+Approve/reject per tranche or in bulk, click anywhere on a
 member card to make it the keeper, then *Export decisions* — the downloaded
 `decisions.json` is what `apply` executes. Vim-style keys throughout
 (`?` shows the map): `j`/`k`/`gg`/`G` navigate, `a`/`x` approve/reject and

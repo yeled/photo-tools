@@ -94,6 +94,13 @@ tier:
     partial     czkawka matched some but not all members
     unverified  czkawka found no relation (Apple-only claim) -- review these!
 
+Each tier asks whether evidence of ITS OWN kind links the whole tranche into
+one connected piece. A still distance speaks only for the stills it was
+measured between, so a member reached only by a video match cannot inherit
+one (it caps at `video`), and two verified pairs bridged by a single edge of
+another kind are `partial`, not one verified group -- copies of one photo
+land in one czkawka group, so two disjoint groups mean two different photos.
+
 The review page (static HTML, no dependencies) shows each tranche side by
 side: thumbnails, metadata, every date candidate (implausible ones struck
 through), the proposed keeper and merged date. Click anywhere on a member
@@ -118,6 +125,7 @@ Options (see each subcommand's --help):
     --limit N                scan only the first N groups (smoke tests)
     --skip-czkawka/--skip-exif  skip those scan steps
     --near N                 czkawka image max distance (default 10)
+    --video-tolerance N      czkawka video max frame difference (default 5)
     --max-wal-gb F           refuse osxphotos reader above this WAL size (2.0)
     --min-plausible-year Y   older dates are implausible (default 1990)
     --date-spread-warn-days D  warn when candidates span more (default 2)
@@ -711,6 +719,12 @@ def drop_burst_only_tranches(tranches: List[dict], members: Dict[str, dict]
 
 CZKAWKA_TOOLS = ("dup", "image", "video")
 
+# czkawka's own default is 10, which on a farm of Live Photo clips linked as
+# many wrong pairs as right ones. Scored against clip pairs whose stills
+# independently match: tolerance 10 gave 71 true links and 70 false, 5 gave
+# 64 and 15. Costs ~10% of the true links to cut the false ones by 4-5x.
+DEFAULT_VIDEO_TOLERANCE = 5
+
 
 def parse_tools(value: str) -> List[str]:
     """--czkawka-tools "dup,image" -> ["dup", "image"], in canonical order."""
@@ -722,14 +736,51 @@ def parse_tools(value: str) -> List[str]:
     return [t for t in CZKAWKA_TOOLS if t in names]
 
 
-def czkawka_group_sets(out_dir: Path) -> List[Set[str]]:
+def czkawka_group_sets(out_dir: Path, members: Dict[str, dict]
+                       ) -> Tuple[List[Set[str]], int]:
     """Every czkawka group (dup + image + video) as a set of asset uuids,
-    for feeding the tranche union-find in discovery mode."""
+    for feeding the tranche union-find in discovery mode. Returns the sets
+    and the number of video groups dropped by the sidecar rule below.
+
+    A video group in which EVERY entry is a sidecar is not a union edge. Such
+    a group says "these two clips look alike" -- never "these two photos are
+    the same" -- and czkawka's perceptual video hash is unreliable on the
+    ~2-second clips behind Live Photos: scored against pairs whose stills
+    independently match, half its links at the default tolerance were wrong.
+    Where it is right the stills match too and that edge already unites the
+    assets; where it is wrong it drags an unrelated photo into the tranche
+    wearing the still pair's confidence. Groups holding at least one PRIMARY
+    file stay -- that is the standalone-video-duplicates-a-Live-Photo case,
+    which has the file the asset actually shows to stand on."""
     sets: List[Set[str]] = []
+    dropped = 0
     for name in ("czkawka_dup.json", "czkawka_image.json", "czkawka_video.json"):
         for group in load_czkawka(out_dir, name):
+            if name == "czkawka_video.json" and sidecar_only(group, members):
+                dropped += 1
+                continue
             sets.append(set(group))
-    return sets
+    return sets, dropped
+
+
+def entry_is_sidecar(uuid: str, entry: dict, members: Dict[str, dict]) -> bool:
+    """True when a farm entry is one of an asset's SIDECAR files -- a Live
+    Photo's .mov, a RAW beside its JPEG -- rather than the file the asset
+    actually shows. An unknown asset or unknown primary counts as primary:
+    never claim "sidecar" without the evidence to say so."""
+    primary = (members.get(uuid) or {}).get("path")
+    if not primary:
+        return False
+    name = os.path.basename(entry.get("path") or "")
+    if "__" not in name:
+        return False
+    return name.split("__", 1)[1] != os.path.basename(primary)
+
+
+def sidecar_only(group: Dict[str, dict], members: Dict[str, dict]) -> bool:
+    """A czkawka group in which no member contributed the file it shows."""
+    return bool(group) and all(entry_is_sidecar(u, e, members)
+                               for u, e in group.items())
 
 
 def farm_name(uuid: str, path: str) -> str:
@@ -785,38 +836,65 @@ def tranche_tier(member_uuids: List[str], members: Dict[str, dict],
         if mset <= set(g):
             return "exact", None
 
-    covered: Set[str] = set()
+    # Evidence is split in two, and each tier asks whether its own kind links
+    # the WHOLE tranche into one piece.
+    #
+    # Splitting: a perceptual distance describes the STILLS it was measured
+    # between, so it may only speak for members an image or dup group actually
+    # reached. A member known solely through a video match has no distance of
+    # its own and must not inherit one -- merge the buckets and a tranche whose
+    # third member arrived on a Live Photo clip alone reads "visual-0" on the
+    # strength of the other two.
+    #
+    # Connectivity rather than coverage: two genuine pairs welded by one bogus
+    # video edge cover every member between them, yet nothing ever compared a
+    # member of one pair against a member of the other. Four copies of one
+    # photo land in a single czkawka group; two disjoint groups mean czkawka
+    # says these are two different photos.
+    still_groups, video_groups_hit = [], []
     max_diff: Optional[int] = None
-    dims_equal = True
     for g in image_groups:
         overlap = mset & set(g)
         if len(overlap) >= 2:
-            covered |= overlap
+            still_groups.append(overlap)
             for u in overlap:
                 d = g[u].get("difference")
                 if isinstance(d, int):
                     max_diff = d if max_diff is None else max(max_diff, d)
-    for g in video_groups:
-        overlap = mset & set(g)
-        if len(overlap) >= 2:
-            covered |= overlap
-    # byte-identical subsets still count as covered members
+    # byte-identical subsets are still evidence too
     for g in dup_groups:
         overlap = mset & set(g)
         if len(overlap) >= 2:
-            covered |= overlap
+            still_groups.append(overlap)
+    for g in video_groups:
+        overlap = mset & set(g)
+        if len(overlap) >= 2:
+            video_groups_hit.append(overlap)
 
-    if covered >= mset:
+    if links_all(mset, still_groups):
         dims = {(members[u].get("width"), members[u].get("height")) for u in mset}
-        dims_equal = len(dims) == 1
-        if max_diff == 0 and dims_equal:
+        if max_diff == 0 and len(dims) == 1:
             return "visual-0", 0
         if max_diff is not None:
             return "near", max_diff
         return "video", None
-    if covered:
+    if links_all(mset, still_groups + video_groups_hit):
+        return "video", None
+    if still_groups or video_groups_hit:
         return "partial", max_diff
     return "unverified", None
+
+
+def links_all(mset: Set[str], overlaps: List[Set[str]]) -> bool:
+    """Do these groups tie every member into ONE connected piece?"""
+    uf = UnionFind()
+    for u in mset:
+        uf.find(u)
+    for overlap in overlaps:
+        members = sorted(overlap)
+        for other in members[1:]:
+            uf.union(members[0], other)
+    return len({uf.find(u) for u in mset}) == 1
 
 
 def wal_refusal(wal_bytes: int, max_gb: float) -> Optional[str]:
@@ -1249,7 +1327,8 @@ def chunk_shards(counts: List[Tuple[object, int]], batch_size: int
 def run_czkawka(farm_dir: Path, out_dir: Path, near: int, verbose: Callable,
                 threads: int = 0, tools: Sequence[str] = ("dup", "image", "video"),
                 dirs: Optional[Sequence[Path]] = None,
-                json_prefix: str = "czkawka") -> None:
+                json_prefix: str = "czkawka",
+                video_tolerance: int = DEFAULT_VIDEO_TOLERANCE) -> None:
     """Run the selected czkawka tools over dirs (default: the whole farm).
     czkawka caches every hash it computes (keyed by path), so partial runs
     -- the batched warm-up passes -- make the final full pass cheap."""
@@ -1263,7 +1342,8 @@ def run_czkawka(farm_dir: Path, out_dir: Path, near: int, verbose: Callable,
     runs = {
         "dup": [czkawka, "dup", *dir_args, "-m", "1024", "-s", "HASH"],
         "image": [czkawka, "image", *dir_args, "-m", "1024", "-s", str(near)],
-        "video": [czkawka, "video", *dir_args, "-m", "1024"],
+        "video": [czkawka, "video", *dir_args, "-m", "1024",
+                  "-t", str(video_tolerance)],
     }
     # czkawka renders a live progress bar (indicatif) on stderr. Capturing
     # stderr hides it, so let it through whenever we are on a terminal --
@@ -1399,12 +1479,17 @@ def cmd_scan(args: argparse.Namespace) -> int:
                                 threads=args.threads,
                                 tools=[t for t in tools if t != "dup"],
                                 dirs=[d for d, _ in batch],
-                                json_prefix="czkawka_warm")
+                                json_prefix="czkawka_warm",
+                                video_tolerance=args.video_tolerance)
 
         run_czkawka(farm_dir, out_dir, args.near, verbose, threads=args.threads,
-                    tools=tools)
-        cz_group_sets = czkawka_group_sets(out_dir)
+                    tools=tools, video_tolerance=args.video_tolerance)
+        cz_group_sets, cz_sidecar_only = czkawka_group_sets(out_dir, members)
         verbose(f"czkawka: {len(cz_group_sets):,} group(s) across the sweep")
+        if cz_sidecar_only:
+            verbose(f"  ignored {cz_sidecar_only:,} video group(s) matching only "
+                    "sidecars (Live Photo clips); a clip match alone is not "
+                    "evidence two photos are the same")
 
     tranches = build_apple_tranches(rows, cz_group_sets)
     verbose(f"{len(tranches):,} combined tranche(s) before filtering")
@@ -1441,7 +1526,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         build_farm({u: scan_members[u] for u in scan_members
                     if scan_members[u].get("path")}, farm_dir, verbose)
         run_czkawka(farm_dir, out_dir, args.near, verbose, threads=args.threads,
-                    tools=tools)
+                    tools=tools, video_tolerance=args.video_tolerance)
 
     local = sum(1 for m in scan_members.values() if m.get("path"))
     scan = {
@@ -2359,8 +2444,8 @@ const TIPS = {
   "exact": "Byte-for-byte identical files (BLAKE3). Not a judgement call: these really are the same file.",
   "visual-0": "Perceptual distance 0 AND identical dimensions: the same image re-encoded, e.g. a HEIC and its JPEG export.",
   "near": "Perceptual match within the configured distance. Resizes, recompressions and crops land here.",
-  "video": "Matched on video frame signatures rather than still-image hashes.",
-  "partial": "czkawka linked SOME of these but not all; the unlinked ones rest on Apple's word alone.",
+  "video": "Matched on video frame signatures rather than still-image hashes. Includes groups where a member is reached ONLY by a video match, so no still distance covers it -- with Live Photos that clip match can be wrong while the photos are unrelated, so check these by eye.",
+  "partial": "czkawka linked SOME of these but not all, or linked them in separate clusters that nothing ties together; the unlinked ones rest on Apple's word alone.",
   "unverified": "Apple grouped these but czkawka could not confirm any link. The least certain tier.",
   "apple-metadata": "Apple's own Duplicates analysis matched these on metadata (date, size, dimensions).",
   "apple-perceptual": "Apple's own Duplicates analysis matched these on image content.",
@@ -3268,6 +3353,11 @@ def add_scan_args(p: argparse.ArgumentParser) -> None:
                    help="only the first N groups (smoke tests)")
     p.add_argument("--near", type=int, default=DEFAULT_NEAR,
                    help=f"czkawka image max distance (default {DEFAULT_NEAR})")
+    p.add_argument("--video-tolerance", type=int,
+                   default=DEFAULT_VIDEO_TOLERANCE, metavar="N",
+                   help="czkawka video max frame difference, 0-20 (default "
+                   f"{DEFAULT_VIDEO_TOLERANCE}; czkawka's own default of 10 "
+                   "links unrelated Live Photo clips)")
     p.add_argument("--batch-size", type=int, default=0, metavar="N",
                    help="discovery only: hash in pausable batches of ~N files "
                    "(RETURN between batches, q to stop and resume later; "
@@ -3885,6 +3975,56 @@ def selftest() -> None:
     assert tranche_tier(["U1", "U2", "U3"], mem, [], ig, []) == ("partial", 3)
     vg = czkawka_uuid_groups([[{"path": "/f/U1__a.mov"}, {"path": "/f/U2__b.mov"}]])
     assert tranche_tier(["U1", "U2"], mem, [], [], vg) == ("video", None)
+
+    # A member reached ONLY by a video match has no perceptual distance of its
+    # own: it may not inherit the still pair's. This is the Live Photo bug --
+    # two clips "match", and an unrelated photo joins a real pair wearing its
+    # visual-0 badge. Fully covered but not by stills => "video", never
+    # "visual-0"/"near"; partly covered stays "partial".
+    memv = dict(mem, U4=_member("U4", w=100, h=100))
+    vg24 = czkawka_uuid_groups([[{"path": "/f/U2__b.mov"},
+                                 {"path": "/f/U4__d.mov"}]])
+    assert tranche_tier(["U1", "U2", "U4"], memv, [], ig0, vg24) == ("video", None)
+    assert tranche_tier(["U1", "U2", "U4"], memv, [], ig, vg24) == ("video", None)
+    assert tranche_tier(["U1", "U2", "U4"], memv, [], ig0, []) == ("partial", 0)
+    # the honest visual-0 is untouched
+    assert tranche_tier(["U1", "U2"], memv, [], ig0, vg24) == ("visual-0", 0)
+
+    # ...and coverage is not enough: two real pairs welded by one video edge
+    # cover all four members, but nothing compared a member of one pair
+    # against the other, so the tranche is not still-verified.
+    memw = dict(memv, U5=_member("U5", w=100, h=100))
+    pair_a = czkawka_uuid_groups([[{"path": "/f/U1__a.jpg", "difference": 0},
+                                   {"path": "/f/U2__b.jpg", "difference": 0}]])
+    pair_b = czkawka_uuid_groups([[{"path": "/f/U4__d.jpg", "difference": 0},
+                                   {"path": "/f/U5__e.jpg", "difference": 0}]])
+    bridge = czkawka_uuid_groups([[{"path": "/f/U2__b.mov"},
+                                   {"path": "/f/U4__d.mov"}]])
+    quad = ["U1", "U2", "U4", "U5"]
+    assert tranche_tier(quad, memw, [], pair_a + pair_b, bridge) == ("video", None)
+    assert tranche_tier(quad, memw, [], pair_a + pair_b, []) == ("partial", 0)
+    assert links_all({"U1", "U2"}, [{"U1", "U2"}])
+    assert not links_all(set(quad), [{"U1", "U2"}, {"U4", "U5"}])
+    assert links_all(set(quad), [{"U1", "U2"}, {"U4", "U5"}, {"U2", "U4"}])
+
+    # sidecar detection drives which video groups may unite assets at all
+    lp = {"A": dict(_member("A"), path="/o/A.HEIC"),
+          "B": dict(_member("B"), path="/o/B.HEIC"),
+          "V": dict(_member("V"), path="/o/V.mov")}
+    clips = czkawka_uuid_groups([[{"path": "/f/A__A_3.mov"},
+                                  {"path": "/f/B__B_3.mov"}]])[0]
+    mixed = czkawka_uuid_groups([[{"path": "/f/A__A_3.mov"},
+                                  {"path": "/f/V__V.mov"}]])[0]
+    stills = czkawka_uuid_groups([[{"path": "/f/A__A.HEIC"},
+                                   {"path": "/f/B__B.HEIC"}]])[0]
+    assert entry_is_sidecar("A", {"path": "/f/A__A_3.mov"}, lp)
+    assert not entry_is_sidecar("A", {"path": "/f/A__A.HEIC"}, lp)
+    assert not entry_is_sidecar("V", {"path": "/f/V__V.mov"}, lp)   # primary IS the mov
+    assert not entry_is_sidecar("A", {"path": "/f/A__A_3.mov"}, {})  # unknown asset
+    assert sidecar_only(clips, lp)          # two Live Photo clips: not evidence
+    assert not sidecar_only(mixed, lp)      # standalone video: keep, it is real
+    assert not sidecar_only(stills, lp)
+    assert not sidecar_only({}, lp)
     assert suggest_approve("exact", []) and not suggest_approve("exact", ["x"])
     assert not suggest_approve("near", [])
 
