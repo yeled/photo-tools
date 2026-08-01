@@ -247,7 +247,13 @@ def parse_exif_dt(text) -> Optional[datetime]:
     except ValueError:
         return None
     if dt.tzinfo is not None:
-        dt = dt.astimezone().replace(tzinfo=None)
+        # Keep the WALL CLOCK and drop the offset: an EXIF timestamp is local
+        # time at the capture location, which is the frame everything here
+        # uses. Converting to the machine's zone would make the same file read
+        # differently depending on where the laptop is.
+        # (A trailing "Z" really is UTC and would need the asset's offset to
+        # become capture-local -- that lives with the QuickTime work.)
+        dt = dt.replace(tzinfo=None)
     return dt
 
 
@@ -913,7 +919,7 @@ def read_members_sqlite(conn: sqlite3.Connection, library: Path,
             "width": r["width"],
             "height": r["height"],
             "photos_date": iso(core_data_to_local(r["created"], r["tz_offset"])),
-            "date_added": iso(core_data_to_local(r["added"])),
+            "date_added": iso(core_data_to_local(r["added"], r["tz_offset"])),
             "tz_offset": r["tz_offset"],
             "favorite": bool(r["favorite"]),
             "flags": flags,
@@ -940,9 +946,14 @@ def _photoinfo_lite(p) -> dict:
     d = p.date
     if d is not None and d.tzinfo is not None:
         d = d.replace(tzinfo=None)
+    # date_added in the photo's zone too, so every timestamp in a member
+    # record follows one rule and the plan is identical on any machine
     added = p.date_added
     if added is not None and added.tzinfo is not None:
-        added = added.astimezone().replace(tzinfo=None)
+        off = getattr(p, "tzoffset", None)
+        added = (added.astimezone(timezone(timedelta(seconds=off)))
+                 if off is not None else added.astimezone())
+        added = added.replace(tzinfo=None)
     path = p.path
     ext = os.path.splitext(p.original_filename or p.filename or "")[1].lstrip(".").lower()
     if not ext and path:
@@ -3193,8 +3204,76 @@ def _member(uuid, filename="f.jpg", w=100, h=100, size=1000, ext=None,
     }
 
 
+def _tz_independence_selftest() -> None:
+    """Every date the tool derives must be identical on any machine.
+
+    The bug this pins: dates were rendered in the MACHINE's zone while EXIF is
+    a bare wall clock at the capture location, so the same library read
+    differently in London and Paris -- and apply "corrected" the invented
+    difference, writing a wrong instant. Passing the offset explicitly is not
+    enough to prove independence; the only honest test is to run the pipeline
+    under several zones and demand byte-identical output. Run the whole
+    selftest under TZ=... to check the rest too.
+    """
+    import time
+
+    zones = ["UTC", "Europe/London", "Europe/Paris", "America/New_York",
+             "Australia/Sydney", "Pacific/Kiritimati"]
+    saved = os.environ.get("TZ")
+    now = datetime(2026, 7, 28, 12, 0, 0)
+    results = []
+    try:
+        for zone in zones:
+            os.environ["TZ"] = zone
+            time.tzset()
+            # 643811597 = 2021-05-27 12:33:17 UTC, captured at +01:00
+            snap = {
+                "capture_local": iso(core_data_to_local(643811597, 3600)),
+                "utc_capture": iso(core_data_to_local(643811597, 0)),
+                "sydney_capture": iso(core_data_to_local(643811597, 36000)),
+                "exif_naive": iso(parse_exif_dt("2021-05-27T13:33:17")),
+                "exif_offset": iso(parse_exif_dt("2021-05-27T13:33:17+01:00")),
+                "exif_compact": iso(parse_exif_dt("2021-05-27T13:33:17+0100")),
+                "exif_native": iso(parse_exif_dt("2021:05:27 13:33:17")),
+            }
+            heic = _member("H", "IMG_5340.HEIC", w=3024, h=4032, size=1_300_000,
+                           photos_date=snap["capture_local"])
+            jpg = _member("J", "IMG_5340.JPG", w=3024, h=4032, size=2_100_000,
+                          photos_date=snap["capture_local"],
+                          exif={"DateTimeOriginal": "2021-05-27T13:33:17"})
+            snap["merged"] = merged_date([heic, jpg], 1990, now, 2.0)[:2]
+            snap["keeper"] = choose_keeper([heic, jpg], 1990, now)
+            snap["suspect_epoch"] = is_suspect_date(datetime(1970, 1, 1), 1990, now)
+            results.append((zone, snap))
+    finally:
+        if saved is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = saved
+        time.tzset()
+
+    first_zone, first = results[0]
+    for zone, snap in results[1:]:
+        if snap != first:
+            diff = {k: (first[k], snap[k]) for k in first if first[k] != snap[k]}
+            raise AssertionError(
+                f"date handling depends on the machine timezone: {first_zone} "
+                f"vs {zone} differ in {diff}")
+    # and the values are the CAPTURE-local ones, not any machine's rendering
+    assert first["capture_local"] == "2021-05-27T13:33:17", first
+    assert first["utc_capture"] == "2021-05-27T12:33:17", first
+    assert first["sydney_capture"] == "2021-05-27T22:33:17", first
+    assert first["exif_offset"] == "2021-05-27T13:33:17", first  # offset dropped
+    assert first["exif_compact"] == first["exif_naive"] == first["exif_native"]
+    # same instant from three candidates; the EXIF one wins the label sort
+    assert first["merged"] == ("2021-05-27T13:33:17", "exif-dto:IMG_5340.JPG"), \
+        first["merged"]
+    assert first["keeper"] == "H"  # HEIC beats the bigger JPEG on format
+
+
 def selftest() -> None:
     now = datetime(2026, 7, 28, 12, 0, 0)
+    _tz_independence_selftest()
 
     # datetime plumbing
     assert parse_exif_dt("2016-08-19T09:12:44") == datetime(2016, 8, 19, 9, 12, 44)

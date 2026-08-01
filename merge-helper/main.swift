@@ -37,6 +37,49 @@ if args.contains("--help") || args.contains("-h") {
     """)
     exit(0)
 }
+// --- selftest: date parsing must not depend on this Mac's timezone ---------
+// The manifest carries wall-clock time at the CAPTURE location plus that
+// location's UTC offset. Parsing it in TimeZone.current instead shifts the
+// instant by however far the Mac has travelled, which is exactly the bug that
+// moved three photos an hour earlier. Runs offline; no Photos access needed.
+if args.contains("--selftest") {
+    let fmt = DateFormatter()
+    fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+    fmt.locale = Locale(identifier: "en_US_POSIX")
+    var failures = 0
+    func check(_ label: String, _ got: Double, _ want: Double) {
+        if got == want {
+            print("ok   \(label)")
+        } else {
+            print("FAIL \(label): got \(got), want \(want)")
+            failures += 1
+        }
+    }
+    // 2021-05-27T13:33:17 at +01:00 is 2021-05-27T12:33:17Z = 643811597
+    // (Core Data epoch 2001-01-01 + 643811597 s), i.e. Unix 1622118797
+    for (off, want) in [(3600, 1622118797.0), (0, 1622122397.0),
+                        (7200, 1622115197.0), (-18000, 1622140397.0)] {
+        fmt.timeZone = TimeZone(secondsFromGMT: off)!
+        guard let d = fmt.date(from: "2021-05-27T13:33:17") else {
+            print("FAIL parse at offset \(off)"); failures += 1; continue
+        }
+        check("wall clock 13:33:17 at offset \(off)", d.timeIntervalSince1970, want)
+    }
+    // the same manifest entry must yield the same instant whatever TZ is set
+    fmt.timeZone = TimeZone(secondsFromGMT: 3600)!
+    let a = fmt.date(from: "2004-06-05T16:15:45")!.timeIntervalSince1970
+    setenv("TZ", "Pacific/Kiritimati", 1)
+    tzset()
+    let fmt2 = DateFormatter()
+    fmt2.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+    fmt2.locale = Locale(identifier: "en_US_POSIX")
+    fmt2.timeZone = TimeZone(secondsFromGMT: 3600)!
+    let b = fmt2.date(from: "2004-06-05T16:15:45")!.timeIntervalSince1970
+    check("same entry, TZ changed under us", a, b)
+    print(failures == 0 ? "merge-helper selftest OK" : "merge-helper selftest FAILED")
+    exit(failures == 0 ? 0 : 1)
+}
+
 let dryRun = !args.contains("--apply")
 var manifestPath: String? = nil
 if let i = args.firstIndex(of: "--manifest"), i + 1 < args.count { manifestPath = args[i + 1] }
