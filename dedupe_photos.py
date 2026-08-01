@@ -204,6 +204,21 @@ def parse_iso(text: Optional[str]) -> Optional[datetime]:
     return datetime.strptime(text, ISO_FMT) if text else None
 
 
+def parse_iso_lenient(text: Optional[str]) -> Optional[datetime]:
+    """A reviewer-typed date. Accepts what the browser's datetime-local gives
+    ("2016-08-19T09:12", no seconds) as well as full ISO and a plain date;
+    returns None for anything unparseable so callers can refuse it."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    raw = text.strip().replace(" ", "T")
+    for fmt in (ISO_FMT, "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def core_data_to_local(value, tz_offset: Optional[float] = None
                        ) -> Optional[datetime]:
     """Core Data timestamp (seconds since 2001-01-01 UTC) -> naive wall-clock
@@ -1912,6 +1927,11 @@ main { padding: 12px 16px 80px; max-width: 1300px; margin: 0 auto; }
 .keeperline b { color: #2e9e44; }
 .keeperline .why { opacity: .8; }
 .keeperline .manual { color: #e8a020; }
+.dateline .override { color: #e8a020; font-weight: 600; }
+.dateline button, .dateline input { font-size: 12px; margin-left: 8px; }
+.member td.cand { cursor: pointer; text-decoration: underline dotted;
+                  text-underline-offset: 2px; }
+.member td.cand:hover { color: #4a90d9; }
 .members { display: flex; gap: 10px; overflow-x: auto; }
 .member { min-width: 400px; max-width: 560px; border: 1px solid
           color-mix(in srgb, CanvasText 15%, Canvas); border-radius: 8px;
@@ -1988,6 +2008,7 @@ kbd { font: 12px ui-monospace, monospace; padding: 0 5px; border-radius: 4px;
 <tr><td><kbd>h</kbd> / <kbd>l</kbd></td><td>cycle keeper</td></tr>
 <tr><td><kbd>o</kbd></td><td>reveal keeper in Photos.app</td></tr>
 <tr><td>exclude</td><td>drop one member: never deleted, never merged</td></tr>
+<tr><td>click a date</td><td>use it as the tranche's merged date</td></tr>
 <tr><td><kbd>?</kbd></td><td>toggle this help</td></tr>
 <tr><td colspan="2" style="padding-top:8px;opacity:.75">
 keeper: resolution → format (RAW&gt;HEIC&gt;PNG&gt;JPEG) → file size
@@ -2095,6 +2116,59 @@ function setKeeper(t, uuid) {
   if (kl) renderKeeperLine(t, kl);
 }
 
+// A reviewer-set merged date. Needed when every candidate is wrong -- a
+// camera with a flat battery clock, a bad bulk import -- where the only other
+// option was to reject the whole tranche.
+const overrideOf = t => (dec[t.key] && dec[t.key].md) || null;
+
+function setMergedDate(t, value) {
+  dec[t.key] = dec[t.key] || {};
+  if (value) dec[t.key].md = value; else delete dec[t.key].md;
+  if (!Object.keys(dec[t.key]).length) delete dec[t.key];
+  save();
+  const card = document.querySelector('.card[data-key="' + t.key + '"]');
+  if (card) {
+    const dl = card.querySelector(".dateline");
+    if (dl) renderDateLine(t, dl);
+    // re-mark which candidate is the winner
+    card.querySelectorAll(".member").forEach(m => {
+      m.querySelectorAll("td.cand").forEach(td => {
+        td.classList.toggle("oldest",
+          td.dataset.iso === (overrideOf(t) || t.merged_date));
+      });
+    });
+  }
+}
+
+function renderDateLine(t, dl) {
+  const ov = overrideOf(t);
+  dl.textContent = "";
+  dl.appendChild(el("span", "", "merged date "));
+  dl.appendChild(el(ov ? "b" : "b", ov ? "override" : "",
+    (ov || t.merged_date || "none").replace("T", " ")));
+  dl.appendChild(el("span", "", ov ? "  your date" :
+    "  from " + (t.date_source || "?") +
+    (t.date_spread_days ? "  (spread " + t.date_spread_days + "d)" : "")));
+  const edit = el("button", "", ov ? "change" : "set date");
+  edit.title = "Type a merged date, or click any date below to use it";
+  edit.onclick = ev => {
+    ev.stopPropagation();
+    const now = ov || t.merged_date || "";
+    const got = prompt(
+      "Merged date for this tranche (YYYY-MM-DD HH:MM:SS).\n" +
+      "Wall clock where the photo was taken. Blank restores the computed date.",
+      now);
+    if (got === null) return;
+    setMergedDate(t, got.trim() || null);
+  };
+  dl.appendChild(edit);
+  if (ov) {
+    const reset = el("button", "", "reset");
+    reset.onclick = ev => { ev.stopPropagation(); setMergedDate(t, null); };
+    dl.appendChild(reset);
+  }
+}
+
 function syncCard(card) {
   const s = state(card.dataset.key);
   card.classList.toggle("approved", s === "approved");
@@ -2180,7 +2254,7 @@ function memberCard(t, uuid) {
   card.appendChild(el("div", "name",
     ((m.flags || []).includes("video") ? "▶ " : "") + (m.filename || uuid)));
   const tbl = document.createElement("table");
-  const oldest = t.merged_date;
+  const oldest = overrideOf(t) || t.merged_date;
   const row = (k, v, cls) => {
     const tr = document.createElement("tr");
     tr.appendChild(el("td", "", k));
@@ -2189,11 +2263,15 @@ function memberCard(t, uuid) {
   };
   row("dims", (m.width || "?") + "×" + (m.height || "?") +
       "  " + hsize(m.size) + "  ." + (m.ext || "?"));
+  // every candidate is clickable: adopting one is the common case, far
+  // easier than retyping a timestamp that is already on screen
   const dateRow = (label, val) => {
     if (!val) return;
-    let cls = "";
-    if (val === oldest) cls = "oldest";
-    row(label, val.replace("T", " "), cls);
+    row(label, val.replace("T", " "), val === oldest ? "oldest cand" : "cand");
+    const td = tbl.lastChild.lastChild;
+    td.dataset.iso = val;
+    td.title = "Use this as the merged date for the tranche";
+    td.onclick = ev => { ev.stopPropagation(); setMergedDate(t, val); };
   };
   dateRow("photos", m.photos_date);
   const ex = m.exif || {};
@@ -2244,10 +2322,7 @@ function trancheCard(t) {
   t.warnings.forEach(w => h.appendChild(el("span", "chip warn", w)));
   card.appendChild(h);
   const dl = el("div", "dateline");
-  dl.appendChild(el("span", "", "merged date "));
-  dl.appendChild(el("b", "", (t.merged_date || "none").replace("T", " ")));
-  dl.appendChild(el("span", "", "  from " + (t.date_source || "?") +
-    (t.date_spread_days ? "  (spread " + t.date_spread_days + "d)" : "")));
+  renderDateLine(t, dl);
   card.appendChild(dl);
   const kl = el("div", "keeperline");
   card.appendChild(kl);
@@ -2606,12 +2681,25 @@ def build_apply_worklist(plan: dict, decisions: Dict[str, dict],
         if excluded:
             rec["excluded"] = sorted(excluded)
 
-        if t["merged_date"] and not _dt_close(live[keeper]["date"], t["merged_date"]):
+        # A reviewer-supplied date wins over the computed one: when every
+        # candidate is wrong (a camera with a flat clock, a bad bulk import)
+        # there is otherwise no way to say so except rejecting the tranche.
+        override = (decisions.get(key) or {}).get("md")
+        merged = t["merged_date"]
+        if override:
+            if parse_iso_lenient(override) is None:
+                work["skipped"].append({"key": key,
+                                        "reason": f"bad-date-override:{override}"})
+                continue
+            merged = iso(parse_iso_lenient(override))
+            rec["date_override"] = merged
+
+        if merged and not _dt_close(live[keeper]["date"], merged):
             # merged_date is capture-local wall clock; the keeper's own UTC
             # offset turns it back into the right absolute instant. Without
             # it merge-helper would assume the machine's current zone.
             work["dates"].append({"tranche": key, "uuid": keeper,
-                                  "date": t["merged_date"],
+                                  "date": merged,
                                   "utc_offset": live[keeper].get("tz_offset"),
                                   "old_date": live[keeper]["date"]})
         if any(live[u]["favorite"] for u in members) \
@@ -2658,11 +2746,14 @@ def build_apply_worklist(plan: dict, decisions: Dict[str, dict],
 
 
 def verify_tranche(t: dict, keeper: str, live: Dict[str, dict],
-                   excluded: Optional[Set[str]] = None) -> str:
+                   excluded: Optional[Set[str]] = None,
+                   date_override: Optional[str] = None) -> str:
     if not live[keeper]["exists"] or live[keeper]["trashed"]:
         return "keeper-missing"
-    date_ok = (not t["merged_date"]
-               or _dt_close(live[keeper]["date"], t["merged_date"]))
+    want = t["merged_date"]
+    if date_override and parse_iso_lenient(date_override):
+        want = iso(parse_iso_lenient(date_override))
+    date_ok = not want or _dt_close(live[keeper]["date"], want)
     # excluded members were never meant to go, so they must not read as pending
     skip = excluded or set()
     losers = [u for u in t["members"] if u != keeper and u not in skip]
@@ -3047,9 +3138,11 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     states: Dict[str, List[str]] = {}
     for t, keeper in approved:
-        excluded = set((decisions.get(t["key"]) or {}).get("x") or [])
-        states.setdefault(verify_tranche(t, keeper, live, excluded),
-                          []).append(t["key"])
+        d = decisions.get(t["key"]) or {}
+        excluded = set(d.get("x") or [])
+        states.setdefault(
+            verify_tranche(t, keeper, live, excluded, d.get("md")),
+            []).append(t["key"])
     print(f"Verify: {len(approved):,} approved tranche(s)")
     for state in sorted(states):
         print(f"  {state:<15} {len(states[state]):,}")
@@ -3819,6 +3912,35 @@ def selftest() -> None:
                                  "date": None, "favorite": False})
     assert verify_tranche(tx, "U1", live_done, {"U3"}) == "complete"
     assert verify_tranche(tx, "U1", live_done, set()) == "losers-pending"
+
+    # reviewer-supplied merged date overrides the computed one
+    assert parse_iso_lenient("2016-08-19T09:12:44") == datetime(2016, 8, 19, 9, 12, 44)
+    assert parse_iso_lenient("2016-08-19T09:12") == datetime(2016, 8, 19, 9, 12)
+    assert parse_iso_lenient("2016-08-19 09:12:44") == datetime(2016, 8, 19, 9, 12, 44)
+    assert parse_iso_lenient("2016-08-19") == datetime(2016, 8, 19, 0, 0)
+    for bad in (None, "", "   ", "nonsense", "19/08/2016", 42):
+        assert parse_iso_lenient(bad) is None, bad
+
+    wo = build_apply_worklist(
+        plan_a, {k12: {"d": "approved", "md": "1999-01-02T03:04:05"}}, live)
+    assert wo["dates"][0]["date"] == "1999-01-02T03:04:05", wo["dates"]
+    assert wo["tranches"][0]["date_override"] == "1999-01-02T03:04:05"
+    # the browser's datetime-local shape (no seconds) is accepted
+    wo2 = build_apply_worklist(
+        plan_a, {k12: {"d": "approved", "md": "1999-01-02T03:04"}}, live)
+    assert wo2["dates"][0]["date"] == "1999-01-02T03:04:00"
+    # an unparseable override refuses the tranche rather than guessing
+    wo3 = build_apply_worklist(
+        plan_a, {k12: {"d": "approved", "md": "last tuesday"}}, live)
+    assert wo3["tranches"] == []
+    assert wo3["skipped"][0]["reason"].startswith("bad-date-override")
+    # ...and verify judges against the override too
+    t12v = next(t for t, _ in approved_tranches(plan_a, dec) if t["key"] == k12)
+    live_ov = dict(live, U1={"exists": True, "trashed": False,
+                             "date": "1999-01-02T03:04:05", "favorite": False})
+    assert verify_tranche(t12v, "U1", live_ov, set(), "1999-01-02T03:04:05") \
+        == "losers-pending"
+    assert verify_tranche(t12v, "U1", live_ov, set()) == "pending"  # vs computed
 
     # mixed orientation: a duplicate keeps its shape
     port = _member("P", "p.mov", w=1080, h=1920)
