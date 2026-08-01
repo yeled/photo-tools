@@ -1922,12 +1922,13 @@ main { padding: 12px 16px 80px; max-width: 1300px; margin: 0 auto; }
 .chip.tier-partial, .chip.tier-unverified { background: #cc333333; }
 .chip.warn { background: #cc333322; }
 .dateline { margin: 2px 0 2px; }
-.dateline b { color: #2e9e44; }
+.dateline b { color: #2e9e44; font-weight: 700; }
 .keeperline { margin: 0 0 8px; font-size: 12px; opacity: .85; }
 .keeperline b { color: #2e9e44; }
 .keeperline .why { opacity: .8; }
 .keeperline .manual { color: #e8a020; }
-.dateline .override { color: #e8a020; font-weight: 600; }
+.dateline .override { color: #e8a020; font-weight: 700; }
+.chip[title] { cursor: help; }
 .dateline button, .dateline input { font-size: 12px; margin-left: 8px; }
 .member td.cand { cursor: pointer; text-decoration: underline dotted;
                   text-underline-offset: 2px; }
@@ -1946,7 +1947,9 @@ main { padding: 12px 16px 80px; max-width: 1300px; margin: 0 auto; }
 .member td { padding: 0 6px 1px 0; vertical-align: top; font-size: 12px; }
 .member td:first-child { opacity: .55; white-space: nowrap; }
 .suspect { text-decoration: line-through; opacity: .6; }
-.oldest { color: #2e9e44; font-weight: 600; }
+/* the merged date itself is bold; the candidates that merely match it are
+   green but plain, so the chosen value is what the eye lands on */
+.oldest { color: #2e9e44; font-weight: 400; }
 .actions { margin-top: 8px; display: flex; gap: 8px; align-items: center; }
 .spacer { flex: 1; }
 footer.load { text-align: center; padding: 16px; }
@@ -2311,15 +2314,60 @@ function cleanExif(v) {
   return v;
 }
 
+// Every chip explains itself on hover -- "near d4" or "metadata" mean nothing
+// on their own, yet the difference between them decides how much scrutiny a
+// tranche deserves.
+const TIPS = {
+  "exact": "Byte-for-byte identical files (BLAKE3). Not a judgement call: these really are the same file.",
+  "visual-0": "Perceptual distance 0 AND identical dimensions: the same image re-encoded, e.g. a HEIC and its JPEG export.",
+  "near": "Perceptual match within the configured distance. Resizes, recompressions and crops land here.",
+  "video": "Matched on video frame signatures rather than still-image hashes.",
+  "partial": "czkawka linked SOME of these but not all; the unlinked ones rest on Apple's word alone.",
+  "unverified": "Apple grouped these but czkawka could not confirm any link. The least certain tier.",
+  "apple-metadata": "Apple's own Duplicates analysis matched these on metadata (date, size, dimensions).",
+  "apple-perceptual": "Apple's own Duplicates analysis matched these on image content.",
+  "czkawka": "Found by our full-library czkawka sweep. Where this is the only source, Apple missed it.",
+  "suggested": "Byte-identical or visually identical with no warnings: safe to bulk-approve.",
+  "date-spread": "Two or more CAPTURE timestamps disagree with each other. Re-import differences are ignored; this is a real conflict.",
+  "distinct-capture-times": "Three or more members each stamped a different moment: likely a series of separate shots, not copies.",
+  "sequential-filenames": "Names differ only by a running number, how cameras number consecutive captures. Probably not duplicates.",
+  "mixed-orientation": "Portrait and landscape in one group. A duplicate keeps its shape, so the matcher probably reached too far.",
+  "mixed-media": "Mixes stills and video, e.g. a Live Photo and a standalone copy of its motion component.",
+  "burst-mates": "Members belong to the same burst: different frames, not copies.",
+  "missing-original": "At least one original is not on disk.",
+  "all-dates-suspect": "Every timestamp is implausible (epoch placeholder, pre-1990, or in the future).",
+  "czkawka-unverified": "czkawka found no link between these at all.",
+  "czkawka-partial": "czkawka linked only some of the members.",
+};
+
+function tipFor(label) {
+  if (TIPS[label]) return TIPS[label];
+  if (label.indexOf("unmergeable-member") === 0)
+    return "A member lives outside the main library grid (hidden, trashed, or in a shared album) and cannot be merged, so apply skips this tranche.";
+  return label;
+}
+
+function chip(cls, text, tipKey, extra) {
+  const c = el("span", cls, text);
+  c.title = tipFor(tipKey) + (extra || "");
+  return c;
+}
+
 function trancheCard(t) {
   const card = el("div", "card " + state(t.key));
   card.dataset.key = t.key;
   const h = el("h3");
   h.appendChild(el("span", "", "#" + t.id));
-  h.appendChild(el("span", "chip tier-" + t.tier,
-    t.tier + (t.czkawka_max_diff != null ? " d" + t.czkawka_max_diff : "")));
-  t.sources.forEach(s => h.appendChild(el("span", "chip", s.replace("apple-", " "))));
-  t.warnings.forEach(w => h.appendChild(el("span", "chip warn", w)));
+  const dist = t.czkawka_max_diff != null
+    ? "  d" + t.czkawka_max_diff + " is the largest perceptual distance between "
+      + "any two members: 0 is pixel-identical, higher is a looser match."
+    : "";
+  h.appendChild(chip("chip tier-" + t.tier,
+    t.tier + (t.czkawka_max_diff != null ? " d" + t.czkawka_max_diff : ""),
+    t.tier, dist));
+  t.sources.forEach(s =>
+    h.appendChild(chip("chip", s.replace("apple-", " "), s)));
+  t.warnings.forEach(w => h.appendChild(chip("chip warn", w, w)));
   card.appendChild(h);
   const dl = el("div", "dateline");
   renderDateLine(t, dl);
@@ -2338,7 +2386,7 @@ function trancheCard(t) {
   };
   actions.appendChild(mk("Approve", "approved"));
   actions.appendChild(mk("Reject", "rejected"));
-  if (t.suggested) actions.appendChild(el("span", "chip", "suggested"));
+  if (t.suggested) actions.appendChild(chip("chip", "suggested", "suggested"));
   card.appendChild(actions);
   return card;
 }
@@ -3997,7 +4045,9 @@ def selftest() -> None:
     for needle in ('case "j"', "/reveal?uuid=", "keydown", 'id="help"',
                    "setKeeper", "focusTo", 'id="helpbtn"', "/decisions",
                    'id="status"', "downloadDecisions", "renderKeeperLine",
-                   "saved_decisions", "keeper_reason", "function displayOrder"):
+                   "saved_decisions", "keeper_reason", "function displayOrder",
+                   "const TIPS", "function tipFor", "renderDateLine",
+                   "setMergedDate", "toggleExcluded"):
         assert needle in REPORT_TEMPLATE, needle
 
     # saved decisions carry across sessions; junk files degrade to {}

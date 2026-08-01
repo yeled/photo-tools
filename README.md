@@ -172,22 +172,37 @@ every hash is cached, so rerunning the scan resumes where you left off,
 and the final grouping pass always sees the whole set so no pair is
 missed); `--threads 4` caps czkawka's CPU instead, or combine both.
 
-The plan fixes what Apple's Merge button gets wrong. The **keeper** is chosen
-by resolution → format (RAW > HEIC > PNG/TIFF > JPEG) → file size *within
-that format* → oldest timestamp → shortest filename → earliest import → UUID.
+The plan fixes what Apple's Merge button gets wrong.
 
-Format outranks size because bytes only measure quality **within** one codec:
-HEVC is roughly 2× more efficient than JPEG, so the same picture as HEIC is
-about half the size — ranking by bytes keeps the JPEG export over the
-camera's own HEIC original, discarding 10-bit colour, depth maps and HDR gain
-maps for a derived 8-bit copy. A file below `--format-floor-pct` (default
-25%) of the biggest same-resolution file forfeits that advantage, so a
-degraded re-encode can't win on its extension alone. A size difference only
-counts when it is *material* — within `--size-tolerance-pct` (default 1%)
-two copies count as equal, because a few bytes of metadata padding on a
-multi-megabyte file says nothing about which is better. So the original beats
-a re-import whose date drifted, `IMG_1234-2.tif` loses to `IMG_1234.tif`, and
-a genuinely larger or higher-resolution file still wins outright.
+### The decision ladder
+
+Which copy survives is decided one rung at a time. Each rung only sees the
+members that tied on the rung above it, and the first rung that separates
+them wins — the review page names that rung for every tranche, so the
+answer to "why this one?" is always on screen.
+
+| # | rung | rule |
+| --- | --- | --- |
+| 1 | **Resolution** | Most pixels wins outright. |
+| 2 | **Format** | RAW > HEIC > PNG/TIFF > JPEG. A file below `--format-floor-pct` (25%) of the biggest same-resolution file forfeits this, so a degraded re-encode can't win on its extension. |
+| 3 | **File size** | Only *within* the surviving format, and only when **material**: differences under `--size-tolerance-pct` (1%) count as a tie. |
+| 4 | **Oldest timestamp** | The oldest *plausible* capture time — the original, not a re-import whose date drifted. |
+| 5 | **Shortest filename** | `IMG_1234.tif` beats `IMG_1234-2.tif`; suffixes mark copies and re-saves. |
+| 6 | **Earliest import** | Library bookkeeping, so it ranks below anything about the photo itself. |
+| 7 | **UUID** | Deterministic backstop. When a tranche gets this far the pick really is arbitrary, and the page says so. |
+
+Two rungs are counter-intuitive and deliberate. **Format outranks size**
+because bytes only measure quality *within* one codec: HEVC is roughly 2×
+more efficient than JPEG, so the same picture as HEIC is about half the
+size — ranking by bytes keeps the JPEG export over the camera's own HEIC
+original, discarding 10-bit colour, depth maps and HDR gain maps for a
+derived 8-bit copy. And **filename outranks import order**, because which
+copy landed in the library first is noise, while a `-2` suffix is evidence.
+
+A date never outranks image quality; it only replaces what used to be a coin
+flip. On a 47k-tranche plan that moved arbitrary UUID picks from 20% of
+tranches to under 2%.
+
 **All dates are wall clock at the capture location**, not the machine's
 current timezone — Photos stores an instant plus the capture UTC offset while
 EXIF stores a bare wall clock, so rendering Photos dates locally made the two
