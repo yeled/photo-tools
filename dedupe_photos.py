@@ -455,6 +455,7 @@ def keeper_reason(members: List[dict], keeper: str,
             "arbitrary; choose by albums/keywords if it matters")
 
 
+_HAS_OFFSET_RE = re.compile(r"(?:[+-]\d{2}:?\d{2}|Z)$")
 _SEQ_RE = re.compile(r"^(.*?)(\d+)(\D*)$")
 
 
@@ -982,6 +983,10 @@ def _photoinfo_lite(p) -> dict:
         "filename": p.original_filename or p.filename or p.uuid,
         "ext": ext,
         "path": path,
+        # a Live Photo's .mov and a RAW sidecar are part of the same asset;
+        # hashing them too is how a standalone copy of either gets found
+        "extra_paths": [q for q in (getattr(p, "path_live_photo", None),
+                                    getattr(p, "path_raw", None)) if q],
         "thumb_source": path,
         "size": getattr(p, "original_filesize", None),
         "width": p.width,
@@ -1047,7 +1052,12 @@ def enrich_members_osxphotos(db, members: Dict[str, dict], uuids: Set[str],
 
 def run_exiftool(members: Dict[str, dict], out_dir: Path, verbose: Callable) -> dict:
     """One batched exiftool run over every locally-present original.
-    QuickTimeUTC=1 renders QuickTime dates in local time like everything else."""
+
+    Deliberately NOT using -api QuickTimeUTC=1: that renders QuickTime's
+    UTC timestamps in the timezone of whatever machine runs exiftool, so the
+    same .mov read differently in London and New York. Values come back as
+    stored and normalize_quicktime_utc() converts the UTC ones using each
+    asset's own capture offset."""
     exiftool = shutil.which("exiftool")
     if not exiftool:
         verbose("exiftool not found on PATH; skipping EXIF date candidates")
@@ -1059,8 +1069,8 @@ def run_exiftool(members: Dict[str, dict], out_dir: Path, verbose: Callable) -> 
     listfile.write_text("\n".join(sorted(paths)) + "\n")
     verbose(f"exiftool: reading dates from {len(paths):,} original(s)...")
     proc = subprocess.run(
-        [exiftool, "-j", "-f", "-fast2", "-api", "QuickTimeUTC=1",
-         "-d", "%Y-%m-%dT%H:%M:%S",
+        [exiftool, "-j", "-f", "-fast2",
+         "-d", "%Y-%m-%dT%H:%M:%S%z",
          "-DateTimeOriginal", "-CreateDate", "-CreationDate",
          "-@", str(listfile)],
         capture_output=True, text=True)
@@ -1084,6 +1094,60 @@ def farm_shard(uuid: str) -> str:
     return _norm_uuid(uuid)[:2]
 
 
+def member_files(m: dict) -> List[str]:
+    """Every original file belonging to one asset: the primary plus any
+    sidecars (a Live Photo's .mov, a RAW alongside its JPEG).
+
+    All of them carry the SAME uuid into the farm, so czkawka matching one
+    of them matches the asset. A group made only of one asset's own files
+    collapses to a single uuid and is dropped, so an asset never pairs with
+    itself -- but a standalone video that duplicates a Live Photo's motion
+    component now shows up, which it could not when only the still was
+    hashed."""
+    files = [m["path"]] if m.get("path") else []
+    for extra in (m.get("extra_paths") or []):
+        if extra and extra not in files:
+            files.append(extra)
+    return files
+
+
+QUICKTIME_UTC_TAGS = ("CreateDate",)
+
+
+def normalize_quicktime_utc(member: dict) -> dict:
+    """Rewrite a video's UTC QuickTime timestamps as capture-local wall clock.
+
+    QuickTime stores CreateDate in UTC by spec, while EXIF DateTimeOriginal on
+    a still is already local. Without this the two frames get compared against
+    each other -- and because merged_date takes the MINIMUM, a UTC value read
+    west of where it was shot wins wrongly and backdates the tranche.
+
+    CreationDate (com.apple.quicktime.creationdate) carries the real capture
+    offset, so its wall clock is already local and parse_exif_dt handles it.
+
+    Note a "+0000" suffix on CreateDate means "this value is UTC", NOT "this
+    was filmed at UTC" -- exiftool annotates the tag's own semantics. Treating
+    it as already-local would leave a Sydney clip eleven hours early, and
+    early values win the merged-date minimum. Only a NON-ZERO offset marks a
+    value that is genuinely local already."""
+    exif = member.get("exif")
+    if not exif or "video" not in (member.get("flags") or []):
+        return member
+    off = member.get("tz_offset")
+    if off is None:
+        return member
+    for tag in QUICKTIME_UTC_TAGS:
+        raw = exif.get(tag)
+        dt = parse_exif_dt(raw)
+        if dt is None:
+            continue
+        m = _HAS_OFFSET_RE.search(raw) if isinstance(raw, str) else None
+        if m and m.group(0) not in ("+0000", "+00:00", "Z"):
+            continue  # already carries a real local offset
+        exif[tag] = iso(dt + timedelta(seconds=float(off)))
+    return member
+
+
 def build_farm(members: Dict[str, dict], farm_dir: Path, verbose: Callable) -> int:
     """Hardlink every locally-present original into farm_dir as
     <shard>/<uuid>__<basename>. Rebuild is incremental; stale entries
@@ -1092,8 +1156,8 @@ def build_farm(members: Dict[str, dict], farm_dir: Path, verbose: Callable) -> i
     farm_dir.mkdir(parents=True, exist_ok=True)
     wanted: Dict[str, str] = {}
     for uuid, m in sorted(members.items()):
-        if m.get("path"):
-            wanted[f"{farm_shard(uuid)}/{farm_name(uuid, m['path'])}"] = m["path"]
+        for path in member_files(m):
+            wanted[f"{farm_shard(uuid)}/{farm_name(uuid, path)}"] = path
     for existing in farm_dir.rglob("*"):
         if existing.is_file() and str(existing.relative_to(farm_dir)) not in wanted:
             existing.unlink()
@@ -1316,6 +1380,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     exif = {} if args.skip_exif else run_exiftool(scan_members, out_dir, verbose)
     for uuid, tags in exif.items():
         scan_members[uuid]["exif"] = tags
+        normalize_quicktime_utc(scan_members[uuid])
 
     # apple-only mode: czkawka runs as a verifier over just the tranche
     # members (discovery mode already scanned them all above)
@@ -3236,6 +3301,17 @@ def _tz_independence_selftest() -> None:
                 "exif_compact": iso(parse_exif_dt("2021-05-27T13:33:17+0100")),
                 "exif_native": iso(parse_exif_dt("2021:05:27 13:33:17")),
             }
+            # a video's QuickTime CreateDate is UTC; it must land on the same
+            # capture-local wall clock no matter which zone the Mac is in
+            mov = _member("V", "IMG_1.MOV", flags=("video",),
+                          exif={"CreateDate": "2021-05-27T12:33:17"})
+            mov["tz_offset"] = 3600
+            snap["qt_utc"] = normalize_quicktime_utc(mov)["exif"]["CreateDate"]
+            # ...but one that already carries an offset is left alone
+            mov2 = _member("V2", "IMG_2.MOV", flags=("video",),
+                           exif={"CreateDate": "2021-05-27T13:33:17+01:00"})
+            mov2["tz_offset"] = 3600
+            snap["qt_offset"] = normalize_quicktime_utc(mov2)["exif"]["CreateDate"]
             heic = _member("H", "IMG_5340.HEIC", w=3024, h=4032, size=1_300_000,
                            photos_date=snap["capture_local"])
             jpg = _member("J", "IMG_5340.JPG", w=3024, h=4032, size=2_100_000,
@@ -3268,6 +3344,9 @@ def _tz_independence_selftest() -> None:
     # same instant from three candidates; the EXIF one wins the label sort
     assert first["merged"] == ("2021-05-27T13:33:17", "exif-dto:IMG_5340.JPG"), \
         first["merged"]
+    # UTC 12:33:17 shot at +01:00 is 13:33:17 where it was taken, in any zone
+    assert first["qt_utc"] == "2021-05-27T13:33:17", first["qt_utc"]
+    assert first["qt_offset"] == "2021-05-27T13:33:17+01:00", first["qt_offset"]
     assert first["keeper"] == "H"  # HEIC beats the bigger JPEG on format
 
 
@@ -3503,6 +3582,48 @@ def selftest() -> None:
     assert {"Y1", "Y2"} in kept_sets          # mixed burst membership
     assert {"U1", "U2", "U3"} in kept_sets    # apple-sourced, kept regardless
     assert drop_burst_only_tranches([], {}) == ([], 0)
+
+    # every file of an asset reaches the farm under that asset's uuid
+    live = _member("LP", "IMG_9.HEIC", flags=("live",))
+    live["path"] = "/o/IMG_9.HEIC"
+    live["extra_paths"] = ["/o/IMG_9.mov"]
+    assert member_files(live) == ["/o/IMG_9.HEIC", "/o/IMG_9.mov"]
+    assert member_files(_member("N", "n.jpg")) == []            # no local file
+    dup_extra = dict(live, extra_paths=["/o/IMG_9.HEIC"])       # extra == primary
+    assert member_files(dup_extra) == ["/o/IMG_9.HEIC"]
+    # ...and both map back to the one asset, so it never pairs with itself
+    assert {farm_uuid(farm_name("LP", p)) for p in member_files(live)} == {"LP"}
+    selfpair = czkawka_uuid_groups([[{"path": "/f/LP__IMG_9.HEIC"},
+                                     {"path": "/f/LP__IMG_9.mov"}]])
+    assert selfpair == [], selfpair
+    cross = czkawka_uuid_groups([[{"path": "/f/LP__IMG_9.mov"},
+                                  {"path": "/f/OTHER__clip.mov"}]])
+    assert len(cross) == 1 and set(cross[0]) == {"LP", "OTHER"}
+
+    # QuickTime UTC normalisation only touches bare-UTC video tags
+    assert _HAS_OFFSET_RE.search("2021-05-27T13:33:17+01:00")
+    assert _HAS_OFFSET_RE.search("2021-05-27T13:33:17Z")
+    assert not _HAS_OFFSET_RE.search("2021-05-27T13:33:17")
+    still = _member("S", "s.jpg", exif={"CreateDate": "2021-05-27T12:33:17"})
+    still["tz_offset"] = 3600
+    assert normalize_quicktime_utc(still)["exif"]["CreateDate"] == \
+        "2021-05-27T12:33:17"  # not a video: untouched
+    noff = _member("V3", "v.mov", flags=("video",),
+                   exif={"CreateDate": "2021-05-27T12:33:17"})
+    assert normalize_quicktime_utc(noff)["exif"]["CreateDate"] == \
+        "2021-05-27T12:33:17"  # no offset known: untouched
+    # "+0000" is exiftool saying "this tag is UTC", not "filmed at UTC" --
+    # a real file looks like this, and a Sydney clip must not land 11h early
+    syd = _member("V4", "v.mov", flags=("video",),
+                  exif={"CreateDate": "2023-01-06T14:43:45+0000"})
+    syd["tz_offset"] = 39600
+    assert normalize_quicktime_utc(syd)["exif"]["CreateDate"] == \
+        "2023-01-07T01:43:45", syd["exif"]
+    utc0 = _member("V5", "v.mov", flags=("video",),
+                   exif={"CreateDate": "2023-01-06T14:43:45+0000"})
+    utc0["tz_offset"] = 0
+    assert normalize_quicktime_utc(utc0)["exif"]["CreateDate"] == \
+        "2023-01-06T14:43:45"  # matches what this library actually stores
 
     # farm names round-trip; sharding is stable and uuid-derived
     assert farm_uuid(farm_name("ABC-123", "/x/y/IMG__weird__name.HEIC")) == "ABC-123"
