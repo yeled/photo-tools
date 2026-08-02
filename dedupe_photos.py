@@ -1634,13 +1634,30 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
     for i, t in enumerate(tranches, start=1):
         t["id"] = i
 
-    # czkawka links that cross Apple's group boundaries: a preview of what a
-    # full-library scan will add (czkawka relates assets Apple kept apart)
+    # czkawka links that cross tranche boundaries. In discovery mode the
+    # union-find has already merged every link it accepts, so anything left
+    # here is a link it deliberately REFUSED -- overwhelmingly sidecar-only
+    # video groups, whose hashes are unreliable on Live Photo clips. Counting
+    # those would report rejected evidence as pending work, so the same rule
+    # is applied here and only genuinely unexplained links are reported.
     uuid_tranche = {u: t["key"] for t in tranches for u in t["members"]}
     cross: Set[Tuple[str, str]] = set()
-    for groups in (dup_groups, image_groups, video_groups):
+    refused = 0
+    for groups, is_video in ((dup_groups, False), (image_groups, False),
+                             (video_groups, True)):
         for g in groups:
             keys = sorted({uuid_tranche.get(u) for u in g} - {None})
+            if len(keys) < 2:
+                continue
+            # plan-time variant of sidecar_only(): the plan holds only tranche
+            # members, so a group can include library assets it cannot
+            # classify. Judge on the entries we CAN see -- requiring all of
+            # them, as the scan does, would report refused links as mysteries.
+            known = {u: e for u, e in g.items() if u in members}
+            if is_video and known and all(entry_is_sidecar(u, e, members)
+                                          for u, e in known.items()):
+                refused += 1
+                continue
             for a in range(len(keys)):
                 for b in range(a + 1, len(keys)):
                     cross.add((keys[a], keys[b]))
@@ -1685,6 +1702,7 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
             "warnings": dict(sorted(warning_counts.items())),
             "suggested_auto_approve": sum(1 for t in tranches if t["suggested"]),
             "czkawka_cross_tranche_links": len(cross),
+            "czkawka_sidecar_only_links_refused": refused,
         },
         "tranches": tranches,
         "members": {u: member_public(m) for u, m in sorted(members.items())},
@@ -1742,10 +1760,14 @@ def cmd_plan(args: argparse.Namespace) -> int:
         print(f"Warnings: {shown}{extra}")
     print(f"Suggested auto-approvals (exact/visual-0, no warnings): "
           f"{s['suggested_auto_approve']:,}")
+    if s.get("czkawka_sidecar_only_links_refused"):
+        print(f"Note: {s['czkawka_sidecar_only_links_refused']:,} video group(s) "
+              "link tranches only through Live Photo sidecars; those links are "
+              "refused on purpose (unreliable hashes on ~2s clips).")
     if s["czkawka_cross_tranche_links"]:
-        print(f"Note: czkawka links {s['czkawka_cross_tranche_links']:,} pair(s) "
-              "of tranches Apple kept apart -- the full-library scan (phase 2) "
-              "will surface those properly.")
+        print(f"Note: {s['czkawka_cross_tranche_links']:,} czkawka link(s) cross "
+              "tranche boundaries without being merged. In discovery mode that "
+              "should be zero -- worth a look.")
     print(f"\nWrote {out_dir / 'plan.json'}, keepers.txt, losers.txt")
     print(f"Next: osxphotos run {SCRIPT} review --out {out_dir} --open")
     return 0
