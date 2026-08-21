@@ -183,7 +183,7 @@ answer to "why this one?" is always on screen.
 
 | # | rung | rule |
 | --- | --- | --- |
-| 1 | **Resolution** | Most pixels wins outright. |
+| 1 | **Resolution** | Most pixels wins outright — but only when **material**: differences under `--pixel-tolerance-pct` (1%) count as a tie. |
 | 2 | **Format** | RAW > HEIC > PNG/TIFF > JPEG. A file below `--format-floor-pct` (25%) of the biggest same-resolution file forfeits this, so a degraded re-encode can't win on its extension. |
 | 3 | **File size** | Only *within* the surviving format, and only when **material**: differences under `--size-tolerance-pct` (1%) count as a tie. |
 | 4 | **Oldest timestamp** | The oldest *plausible* capture time — the original, not a re-import whose date drifted. |
@@ -198,6 +198,16 @@ size — ranking by bytes keeps the JPEG export over the camera's own HEIC
 original, discarding 10-bit colour, depth maps and HDR gain maps for a
 derived 8-bit copy. And **filename outranks import order**, because which
 copy landed in the library first is noise, while a `-2` suffix is evidence.
+
+The tolerance on rung 1 exists for the same reason format outranks size. A
+raw converter trims a few pixels of sensor edge, so the camera's JPEG
+routinely out-measures the DNG of the very same frame — 5216×3472 against
+5212×3468, 0.19% more pixels. Compared exactly, that rounding error knocks
+the raw out on the *first* rung, format never gets a say, and a 12 MB JPEG
+beats a 35 MB raw original. Anything genuinely downscaled is orders of
+magnitude outside the band and still loses outright. When a keeper does win
+with fewer pixels than a rival, the review page says so and names the gap,
+rather than claiming a resolution they didn't have.
 
 A date never outranks image quality; it only replaces what used to be a coin
 flip. On a 47k-tranche plan that moved arbitrary UUID picks from 20% of

@@ -26,15 +26,19 @@ afterwards. apply without --apply is a dry run.
 
 The merge plan fixes what Apple's own Merge button gets wrong:
 
-  * KEEPER (which pixels survive) is chosen by resolution, then file size --
-    but only a MATERIAL size difference counts (outside --size-tolerance-pct,
-    default 1%), because a few bytes of metadata padding on a multi-megabyte
-    file says nothing about which copy is better. Copies within that band are
-    equal quality, so the ladder moves on to format (RAW > HEIC > PNG/TIFF >
-    JPEG), then the oldest timestamp, then the earliest import, then the
-    shortest filename (suffixes like "-2" mark copies and re-saves), then
-    UUID. So the original beats a re-import whose date drifted, while a
-    genuinely bigger or higher-resolution file still wins outright.
+  * KEEPER (which pixels survive) is chosen by resolution, then format
+    (RAW > HEIC > PNG/TIFF > JPEG), then file size -- but neither pixels nor
+    bytes count unless the difference is MATERIAL. A few bytes of metadata
+    padding on a multi-megabyte file says nothing about which copy is better
+    (--size-tolerance-pct, default 1%), and neither do the four pixels of
+    sensor edge by which a camera's JPEG out-measures the DNG of the very same
+    frame (--pixel-tolerance-pct, default 1%) -- compared exactly, that
+    rounding error hands the group to the JPEG. Copies within those bands are
+    equal quality, so the ladder moves on to the oldest timestamp, then the
+    shortest filename (suffixes like "-2" mark copies and re-saves), then the
+    earliest import, then UUID. So the original beats a re-import whose date
+    drifted, while a genuinely bigger or higher-resolution file still wins
+    outright.
   * ALL DATES ARE WALL CLOCK AT THE CAPTURE LOCATION, never the machine's
     current zone. Photos stores an absolute instant plus the capture UTC
     offset; EXIF stores a bare wall clock with no zone at all. Rendering the
@@ -162,6 +166,13 @@ DEFAULT_MIN_PLAUSIBLE_YEAR = 1990
 # bytes of metadata padding. Scale matters, not absolute bytes: 1% of a 3 MB
 # TIFF is 30 KB, still far below a real difference in encoded detail.
 DEFAULT_SIZE_TOL_PCT = 1.0
+# Two copies whose pixel counts are within this percentage are treated as the
+# same resolution. A raw converter trims a few pixels off each edge of the
+# sensor, so the camera's own JPEG is routinely a hair larger than the DNG of
+# the very same frame -- 5216x3472 vs 5212x3468 is 0.19%. Compared exactly,
+# that rounding error knocks the raw out before format is ever consulted and
+# the JPEG wins. Anything genuinely downscaled is far outside this band.
+DEFAULT_PIXEL_TOL_PCT = 1.0
 # A better format only wins if its file is at least this percentage of the
 # biggest same-resolution file. HEIC is ~2x more efficient than JPEG, so a
 # smaller HEIC is normal and must still win; but a file far below even that
@@ -328,22 +339,29 @@ def oldest_plausible(m: dict, min_year: int, now: datetime) -> datetime:
 
 
 def keeper_pool(members: List[dict], size_tol_pct: float,
-                format_floor_pct: float) -> Tuple[List[dict], str]:
+                format_floor_pct: float,
+                pixel_tol_pct: float = DEFAULT_PIXEL_TOL_PCT
+                ) -> Tuple[List[dict], str]:
     """Narrow to the best-quality candidates, returning them and the rung
     that last narrowed the field ("resolution", "format", "size", "" if the
     group never narrowed).
 
-    Order matters: FORMAT is judged before size, because bytes only measure
-    quality within one codec. HEIC is about twice as efficient as JPEG, so
-    the same picture is roughly half the size as HEIC -- comparing the two by
-    byte count picks the JPEG export over the camera's own original every
-    time. Size then compares like with like."""
+    Resolution leads, but only a MATERIAL difference counts (outside
+    pixel_tol_pct of the biggest). A raw file and the camera's JPEG of the
+    same frame differ by a few pixels of sensor edge; treating that as "lower
+    resolution" would eliminate the raw before format is ever judged.
+
+    Order matters after that: FORMAT is judged before size, because bytes only
+    measure quality within one codec. HEIC is about twice as efficient as
+    JPEG, so the same picture is roughly half the size as HEIC -- comparing
+    the two by byte count picks the JPEG export over the camera's own original
+    every time. Size then compares like with like."""
     pool, why = list(members), ""
 
-    best_pix = max(_pixels(m) for m in pool)
-    if any(_pixels(m) != best_pix for m in pool):
+    pix_floor = max(_pixels(m) for m in pool) * (1 - pixel_tol_pct / 100.0)
+    if any(_pixels(m) < pix_floor for m in pool):
         why = "resolution"
-    pool = [m for m in pool if _pixels(m) == best_pix]
+    pool = [m for m in pool if _pixels(m) >= pix_floor]
 
     floor = max((m.get("size") or 0) for m in pool) * format_floor_pct / 100.0
 
@@ -368,21 +386,23 @@ def choose_keeper(members: List[dict],
                   min_year: int = DEFAULT_MIN_PLAUSIBLE_YEAR,
                   now: Optional[datetime] = None,
                   size_tol_pct: float = DEFAULT_SIZE_TOL_PCT,
-                  format_floor_pct: float = DEFAULT_FORMAT_FLOOR_PCT) -> str:
-    """Resolution first, then file size -- but size only counts when the
-    difference is MATERIAL (outside size_tol_pct of the biggest file). Copies
-    within that band are treated as equal quality, so the ladder moves on to
-    format, then the oldest timestamp, then the earliest import, then the
-    shortest filename (suffixes like "-2" mark copies and re-saves), with
-    UUID as the final deterministic backstop.
+                  format_floor_pct: float = DEFAULT_FORMAT_FLOOR_PCT,
+                  pixel_tol_pct: float = DEFAULT_PIXEL_TOL_PCT) -> str:
+    """Resolution first, then format, then file size -- but neither pixels nor
+    bytes count unless the difference is MATERIAL (outside pixel_tol_pct /
+    size_tol_pct of the biggest). Copies within those bands are treated as
+    equal quality, so the ladder moves on: format, then the oldest timestamp,
+    then the shortest filename (suffixes like "-2" mark copies and re-saves),
+    then the earliest import, with UUID as the final deterministic backstop.
 
-    The tolerance is the point: a handful of bytes of EXIF padding on a
+    The tolerances are the point. A handful of bytes of EXIF padding on a
     multi-megabyte file says nothing about which copy is better, so it must
-    not outrank an eleven-year-older capture date. Filename sits ABOVE import
-    date for the same reason -- import order inside one batch is bookkeeping
-    noise, while a "-2" suffix is real evidence of a copy."""
+    not outrank an eleven-year-older capture date; four pixels of sensor edge
+    say nothing either, so they must not outrank a raw original. Filename sits
+    ABOVE import date for the same reason -- import order inside one batch is
+    bookkeeping noise, while a "-2" suffix is real evidence of a copy."""
     now = now or datetime.now()
-    pool, _ = keeper_pool(members, size_tol_pct, format_floor_pct)
+    pool, _ = keeper_pool(members, size_tol_pct, format_floor_pct, pixel_tol_pct)
 
     def key(m: dict):
         return (
@@ -399,11 +419,37 @@ def _pixels(m: dict) -> int:
     return (m.get("width") or 0) * (m.get("height") or 0)
 
 
+def _dims(m: dict) -> str:
+    return f"{m.get('width') or '?'}x{m.get('height') or '?'}"
+
+
+def _res_phrase(members: List[dict], k: dict, pixel_tol_pct: float) -> str:
+    """How the keeper compares on pixels with the rivals it beat on a LATER
+    rung -- i.e. those that survived the resolution rung alongside it, not the
+    final pool, which format and size have already thinned out.
+
+    Says so out loud when the keeper has FEWER pixels than one of them: a raw
+    original next to a slightly wider JPEG reads as a bug unless the page
+    explains that the gap was inside the tolerance."""
+    floor = max(_pixels(m) for m in members) * (1 - pixel_tol_pct / 100.0)
+    tied = [m for m in members if _pixels(m) >= floor]
+    if all(_pixels(m) == _pixels(k) for m in tied):
+        return f"the same {_dims(k)}"
+    best = max(tied, key=_pixels)
+    if _pixels(best) == _pixels(k):
+        return (f"the top resolution ({_dims(k)}), the rest within "
+                f"{pixel_tol_pct:g}%")
+    gap = (_pixels(best) - _pixels(k)) / _pixels(best) * 100
+    return (f"effectively the same resolution ({_dims(k)} vs {_dims(best)}, "
+            f"{gap:.1f}% fewer pixels - inside the {pixel_tol_pct:g}% tolerance)")
+
+
 def keeper_reason(members: List[dict], keeper: str,
                   min_year: int = DEFAULT_MIN_PLAUSIBLE_YEAR,
                   now: Optional[datetime] = None,
                   size_tol_pct: float = DEFAULT_SIZE_TOL_PCT,
-                  format_floor_pct: float = DEFAULT_FORMAT_FLOOR_PCT) -> str:
+                  format_floor_pct: float = DEFAULT_FORMAT_FLOOR_PCT,
+                  pixel_tol_pct: float = DEFAULT_PIXEL_TOL_PCT) -> str:
     """Explain in one phrase which rule made this member the keeper.
 
     Mirrors choose_keeper's ladder exactly (resolution -> bytes -> format ->
@@ -416,32 +462,35 @@ def keeper_reason(members: List[dict], keeper: str,
         return "only member"
 
     now = now or datetime.now()
-    dims = f"{k.get('width') or '?'}x{k.get('height') or '?'}"
+    dims = _dims(k)
     ksize = k.get("size") or 0
 
     # Mirrors keeper_pool's order exactly: resolution, then format, then size.
     # Each message says "of the N tied" rather than "identical" -- claiming
     # members matched on a rung they were already eliminated on was misleading.
-    pool, rung = keeper_pool(members, size_tol_pct, format_floor_pct)
+    pool, rung = keeper_pool(members, size_tol_pct, format_floor_pct,
+                             pixel_tol_pct)
+    res = _res_phrase(members, k, pixel_tol_pct)
+    quality = ""
     if rung == "resolution":
-        return f"highest resolution ({dims})"
-    if rung == "format":
+        quality = f"highest resolution ({dims})"
+    elif rung == "format":
         beaten = sorted({(m.get("ext") or "?") for m in members
                          if m["uuid"] != k["uuid"]
                          and format_rank(m.get("ext") or "") >
                          format_rank(k.get("ext") or "")})
         note = (" - a smaller HEIC is normal, it is ~2x more efficient"
                 if (k.get("ext") or "").lower() in ("heic", "heif") else "")
-        return (f"better format (.{k.get('ext') or '?'} over "
-                f"{', '.join('.' + e for e in beaten) or 'the rest'}) at the "
-                f"same {dims}{note}")
-    if rung == "size":
+        quality = (f"better format (.{k.get('ext') or '?'} over "
+                   f"{', '.join('.' + e for e in beaten) or 'the rest'}) at "
+                   f"{res}{note}")
+    elif rung == "size":
         beaten = max((m.get("size") or 0) for m in members
                      if (m.get("size") or 0) < min((x.get("size") or 0)
                                                    for x in pool))
         gap = f"{(ksize - beaten) / ksize * 100:.1f}%" if ksize else "?"
-        return (f"materially larger file ({hsize(ksize)} vs {hsize(beaten)}, "
-                f"{gap} bigger) - same {dims} and format")
+        quality = (f"materially larger file ({hsize(ksize)} vs {hsize(beaten)}, "
+                   f"{gap} bigger) - {res} and format")
 
     def narrow(pool_, fn):
         best = min(fn(m) for m in pool_ + [k])
@@ -449,14 +498,26 @@ def keeper_reason(members: List[dict], keeper: str,
 
     rivals = [m for m in pool if m["uuid"] != k["uuid"]]
     if not rivals:
-        return f"best quality of the group ({dims}, {hsize(ksize)})"
+        return quality or f"best quality of the group ({dims}, {hsize(ksize)})"
+
+    # A quality rung can narrow the field without DECIDING it -- one JPEG and
+    # two raws leaves the raws still tied. Report the rung that separated
+    # those two and carry the quality rung as a tail, so the page never
+    # answers "why this DNG?" with "because it beat a JPEG".
+    # Deliberately does NOT name a rung: `rung` is only the LAST one that
+    # narrowed, and the drops can be spread across several (a 304x220 scan
+    # goes on resolution, its JPEG sibling on format). Naming one would put a
+    # false claim on the page about the others.
+    lost = len(members) - len(pool)
+    tail = (f"; {lost} lower-quality {'copy' if lost == 1 else 'copies'} "
+            "dropped first" if lost else "")
     n = len(rivals) + 1
 
     rivals, kbest = narrow(rivals, lambda m: oldest_plausible(m, min_year, now))
     if kbest and not rivals:
         return (f"oldest timestamp ({iso(oldest_plausible(k, min_year, now))}) "
                 f"- of the {n} copies tied on pixels, size and format, so the "
-                "original wins")
+                f"original wins{tail}")
 
     # Suffixes like "-2" or a trailing " - 2006-09-23 18-54-00" mark copies
     # and re-saves, so the shortest name is the closest thing to the original.
@@ -465,17 +526,17 @@ def keeper_reason(members: List[dict], keeper: str,
     if kbest and not rivals:
         return (f"shortest filename ({k.get('filename')}) - of the {n} "
                 "otherwise identical; suffixed names like '-2' are usually "
-                "copies or edits")
+                f"copies or edits{tail}")
 
     rivals, kbest = narrow(
         rivals, lambda m: parse_iso(m.get("date_added")) or datetime.max)
     if kbest and not rivals:
         return (f"imported first ({k.get('date_added')}) - of the {n} tied on "
-                "pixels, timestamps and filename")
+                f"pixels, timestamps and filename{tail}")
 
     return (f"{n} copies identical on pixels, size, format, dates and name "
             "length - tie broken by name/UUID order, so this pick is "
-            "arbitrary; choose by albums/keywords if it matters")
+            f"arbitrary; choose by albums/keywords if it matters{tail}")
 
 
 _HAS_OFFSET_RE = re.compile(r"(?:[+-]\d{2}:?\d{2}|Z)$")
@@ -1569,7 +1630,8 @@ def load_czkawka(out_dir: Path, name: str) -> List[Dict[str, dict]]:
 def build_plan(scan: dict, dup_groups, image_groups, video_groups,
                min_year: int, spread_warn_days: float,
                now: Optional[datetime] = None,
-               size_tol_pct: float = DEFAULT_SIZE_TOL_PCT) -> dict:
+               size_tol_pct: float = DEFAULT_SIZE_TOL_PCT,
+               pixel_tol_pct: float = DEFAULT_PIXEL_TOL_PCT) -> dict:
     """Deterministic: no timestamps, stable ordering, so identical inputs
     produce byte-identical plan.json."""
     now = now or datetime.now()
@@ -1582,7 +1644,8 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
                                       dup_groups, image_groups, video_groups)
         m_date, source, spread, warnings = merged_date(
             ms, min_year, now, spread_warn_days)
-        keeper = choose_keeper(ms, min_year, now, size_tol_pct)
+        keeper = choose_keeper(ms, min_year, now, size_tol_pct,
+                               DEFAULT_FORMAT_FLOOR_PCT, pixel_tol_pct)
         for m in ms:
             for flag in m["flags"]:
                 if flag in VISIBILITY_FLAGS:
@@ -1621,7 +1684,9 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
             "czkawka_max_diff": max_diff,
             "keeper": keeper,
             "keeper_reason": keeper_reason(ms, keeper, min_year, now,
-                                           size_tol_pct),
+                                           size_tol_pct,
+                                           DEFAULT_FORMAT_FLOOR_PCT,
+                                           pixel_tol_pct),
             "merged_date": m_date,
             "date_source": source,
             "date_spread_days": spread,
@@ -1682,11 +1747,13 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
         "reader": scan["reader"],
         "generation": scan["generation"],
         "policy": {
-            "keeper": ("pixels desc, format rank (RAW>HEIC>PNG/TIFF>JPEG), "
+            "keeper": (f"pixels desc (ties within {pixel_tol_pct:g}% count as "
+                       "equal), format rank (RAW>HEIC>PNG/TIFF>JPEG), "
                        f"file size within the surviving format (ties within "
                        f"{size_tol_pct:g}% count as equal), oldest timestamp, "
                        "shortest filename, earliest import, uuid"),
             "size_tolerance_pct": size_tol_pct,
+            "pixel_tolerance_pct": pixel_tol_pct,
             "format_floor_pct": DEFAULT_FORMAT_FLOOR_PCT,
             "date": "oldest plausible candidate across tranche",
             "min_plausible_year": min_year,
@@ -1742,7 +1809,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
     plan = build_plan(scan, dup_groups, image_groups, video_groups,
                       args.min_plausible_year, args.date_spread_warn_days,
-                      size_tol_pct=args.size_tolerance_pct)
+                      size_tol_pct=args.size_tolerance_pct,
+                      pixel_tol_pct=args.pixel_tolerance_pct)
     (out_dir / "plan.json").write_text(json.dumps(plan, indent=1, sort_keys=True))
     for kind in ("keepers", "losers"):
         (out_dir / f"{kind}.txt").write_text(
@@ -3420,6 +3488,13 @@ def add_plan_args(p: argparse.ArgumentParser) -> None:
                    "count as equal quality, so the oldest copy wins instead "
                    f"of the one with a few more bytes (default "
                    f"{DEFAULT_SIZE_TOL_PCT:g}; 0 compares exact bytes)")
+    p.add_argument("--pixel-tolerance-pct", type=float,
+                   default=DEFAULT_PIXEL_TOL_PCT, metavar="PCT",
+                   help="pixel counts within this percentage of the biggest "
+                   "count as the same resolution, so a raw original is not "
+                   "beaten by the JPEG's few extra pixels of sensor edge "
+                   f"(default {DEFAULT_PIXEL_TOL_PCT:g}; 0 compares exact "
+                   "pixels)")
 
 
 def add_review_args(p: argparse.ArgumentParser) -> None:
@@ -3499,6 +3574,8 @@ examples:
                        default=DEFAULT_SPREAD_WARN_DAYS)
     p_all.add_argument("--size-tolerance-pct", type=float,
                        default=DEFAULT_SIZE_TOL_PCT)
+    p_all.add_argument("--pixel-tolerance-pct", type=float,
+                       default=DEFAULT_PIXEL_TOL_PCT)
     p_all.add_argument("--open", action="store_true")
     p_all.add_argument("--thumb-size", type=int, default=DEFAULT_THUMB_PX)
     p_all.add_argument("--skip-thumbs", action="store_true")
@@ -3774,6 +3851,40 @@ def selftest() -> None:
     # RAW still outranks HEIC
     dng = _member("DNG", "IMG_1.dng", w=3024, h=4032, size=900000)
     assert choose_keeper([iphone_heic, dng], 1990, now) == "DNG"
+
+    # THE RAW CASE (tranche #66): a raw converter trims a few pixels of sensor
+    # edge, so the camera's JPEG measures 5216x3472 against the DNG's
+    # 5212x3468 -- 0.19% more pixels. Compared exactly that rounding error
+    # eliminates the raw on the FIRST rung and format never gets a say, so the
+    # JPEG wins a group it has no business winning. Within tolerance the two
+    # tie on resolution and .dng takes it.
+    cam_jpg = _member("AAA-JPG", "L1016647.JPG", w=5216, h=3472, size=12_600_000)
+    cam_dng = _member("ZZZ-DNG", "L1016647-2.DNG", w=5212, h=3468, size=36_500_000)
+    assert choose_keeper([cam_jpg, cam_dng], 1990, now) == "ZZZ-DNG"
+    why_raw = keeper_reason([cam_jpg, cam_dng], "ZZZ-DNG", 1990, now)
+    assert why_raw.startswith("better format (.dng over .jpg)"), why_raw
+    # and it SAYS the keeper has fewer pixels -- otherwise the review page
+    # shows a keeper visibly smaller than its rival with no explanation
+    assert "0.2% fewer pixels" in why_raw, why_raw
+    # ...with the tolerance off, exact pixels win again (the old behaviour)
+    assert choose_keeper([cam_jpg, cam_dng], 1990, now,
+                         pixel_tol_pct=0.0) == "AAA-JPG"
+    # the whole tranche: the JPEG plus BOTH raw copies. Format only narrows
+    # 3 -> 2 here, so the reason has to name the rung that picked between the
+    # two raws -- "better format" alone would not answer "why this DNG?".
+    dng_dupe = _member("AAA-DNG2", "L1016647 (2).DNG", w=5212, h=3468,
+                       size=36_400_000, photos_date="2025-09-27T21:37:06")
+    older_dng = _member("ZZZ-DNG", "L1016647-2.DNG", w=5212, h=3468,
+                        size=36_500_000, photos_date="2025-09-27T21:27:06")
+    trio = [cam_jpg, older_dng, dng_dupe]
+    assert choose_keeper(trio, 1990, now) == "ZZZ-DNG"
+    why_trio = keeper_reason(trio, "ZZZ-DNG", 1990, now)
+    assert why_trio.startswith("oldest timestamp (2025-09-27T21:27:06)"), why_trio
+    assert why_trio.endswith("1 lower-quality copy dropped first"), why_trio
+    # a genuinely downscaled copy is nowhere near the band and still loses,
+    # even though it is the better format
+    web_dng = _member("SMALL-DNG", "web.dng", w=1600, h=1065, size=2_000_000)
+    assert choose_keeper([cam_jpg, web_dng], 1990, now) == "AAA-JPG"
     twin = _member("K6", "d.jpg", w=1200, h=1600, size=328294)
     assert "arbitrary" in keeper_reason([b, twin], "K4", 1990, now)
     assert keeper_reason([b], "K4") == "only member"
@@ -3791,6 +3902,9 @@ def selftest() -> None:
     assert keeper_pool([export_jpg, iphone_heic], 1.0, 25.0)[1] == "format"
     assert keeper_pool([a, b], 1.0, 25.0)[1] == "size"
     assert keeper_pool([plain, suffixed], 1.0, 25.0)[1] == ""
+    # a sub-tolerance pixel gap does not count as a narrowing at all
+    assert keeper_pool([cam_jpg, cam_dng], 1.0, 25.0)[1] == "format"
+    assert keeper_pool([cam_jpg, cam_dng], 1.0, 25.0, 0.0)[1] == "resolution"
 
     # the real-world case: byte-identical copies, one a re-import whose date
     # drifted. The older one wins even though its UUID sorts LAST, so this
