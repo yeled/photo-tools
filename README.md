@@ -136,6 +136,201 @@ a terminal and honors `NO_COLOR`, so redirected output stays plain and
 diffable), `--library PATH` reads another library, and `--selftest` runs the
 offline tests (safe on any machine).
 
+## dedupe_photos.py
+
+Deterministic duplicate merging for Photos, phase 1: **read-only** scan +
+plan + review. Apple's own Duplicates analysis is harvested straight from the
+library database — `ZASSET.ZDUPLICATEPERCEPTUALMATCHINGALBUM` /
+`ZDUPLICATEMETADATAMATCHINGALBUM` carry the grouping the Duplicates album
+shows, so nothing needs to be selected or exported — then every group is
+cross-checked with czkawka (`brew install czkawka`; the Homebrew build decodes
+HEIC) by hardlinking the originals into a scratch farm and running its exact
+(BLAKE3), perceptual-image, and video-signature tools over it.
+
+**Assumption: all assets are stored on the Mac** (no iCloud
+"Optimize Storage"). Scan still counts anything it can't find on disk, but
+the pipeline is designed and tested for a fully local library.
+
+```sh
+osxphotos run dedupe_photos.py all --open       # scan + plan + review report
+osxphotos run dedupe_photos.py scan --discover  # sweep the ENTIRE library
+osxphotos run dedupe_photos.py scan --limit 5   # smoke test on 5 groups
+python3 dedupe_photos.py --selftest             # offline tests, safe anywhere
+```
+
+Without `--discover`, tranches are exactly Apple's groups and czkawka only
+*verifies* them. With `--discover`, czkawka sweeps **every local original**
+and its groups feed the same union-find as Apple's: copies Apple missed
+attach to their tranches (3-, 4-, N-member tranches), czkawka links merge
+Apple groups that are really one photo, and czkawka-only tranches appear
+(filter by source in the review page). czkawka-only groups that are entirely
+one burst are dropped as burst siblings (`--include-bursts` keeps them).
+The first sweep perceptually hashes the whole library — hours, cached and
+incremental afterwards. To pace that: `--batch-size 20000` hashes in
+pausable batches (RETURN starts each batch, `a` runs the rest, `q` stops —
+every hash is cached, so rerunning the scan resumes where you left off,
+and the final grouping pass always sees the whole set so no pair is
+missed); `--threads 4` caps czkawka's CPU instead, or combine both.
+
+The plan fixes what Apple's Merge button gets wrong.
+
+### The decision ladder
+
+Which copy survives is decided one rung at a time. Each rung only sees the
+members that tied on the rung above it, and the first rung that separates
+them wins — the review page names that rung for every tranche, so the
+answer to "why this one?" is always on screen.
+
+| # | rung | rule |
+| --- | --- | --- |
+| 1 | **Resolution** | Most pixels wins outright — but only when **material**: differences under `--pixel-tolerance-pct` (1%) count as a tie. |
+| 2 | **Format** | RAW > HEIC > PNG/TIFF > JPEG. A file below `--format-floor-pct` (25%) of the biggest same-resolution file forfeits this, so a degraded re-encode can't win on its extension. |
+| 3 | **Original over render** | `IMG_5169.MOV` beats `IMG_5169_edited.mov`. An edit re-encodes at Photos' own bitrate and comes out *bigger*, so this has to outrank size or bytes crown the derivative. |
+| 4 | **File size** | Only *within* the surviving format, and only when the gap can carry the weight — see below. |
+| 5 | **Oldest timestamp** | The oldest *plausible* capture time — the original, not a re-import whose date drifted. |
+| 6 | **Shortest filename** | `IMG_1234.tif` beats `IMG_1234-2.tif`; suffixes mark copies and re-saves. |
+| 7 | **Earliest import** | Library bookkeeping, so it ranks below anything about the photo itself. |
+| 8 | **UUID** | Deterministic backstop. When a tranche gets this far the pick really is arbitrary, and the page says so. |
+
+Two rungs are counter-intuitive and deliberate. **Format outranks size**
+because bytes only measure quality *within* one codec: HEVC is roughly 2×
+more efficient than JPEG, so the same picture as HEIC is about half the
+size — ranking by bytes keeps the JPEG export over the camera's own HEIC
+original, discarding 10-bit colour, depth maps and HDR gain maps for a
+derived 8-bit copy. And **filename outranks import order**, because which
+copy landed in the library first is noise, while a `-2` suffix is evidence.
+
+### When file size is allowed to decide
+
+Size is a *proxy* for quality, and a coarse one. Measured against exiftool's
+JPEG quality estimate across ~600 tranches of this library — "did the bigger
+file actually hold a better picture?" — the proxy is worthless at the small
+end and reliable at the large end:
+
+| gap (bytes/px) | size wins on **noise** | real quality win |
+| --- | --- | --- |
+| < 0.0025 | **96–100%** | 0–4% |
+| 0.0025 – 0.04 | ~60% | ~40% |
+| > 0.16 | 21% | **79%** |
+
+So the rung asks three questions before eliminating anyone, and stays silent
+if any of them says the bytes aren't evidence:
+
+1. **Is the gap above `--size-gap-bpp` (0.0025 bytes/px)?** A percentage
+   cannot tell 8% of 20 KB from 8% of 20 MB. 4 KB on a 1.9 MP image is
+   nothing; the same 4 KB on a 640×480 thumbnail is nothing too.
+2. **Do the files have equal measured JPEG quality?** Then the bytes differ
+   for some reason that isn't the picture. Where exiftool can read the
+   quantization tables (about 3 in 4 of this library's JPEGs) the real
+   measurement overrides the proxy.
+3. **Is the bigger file merely baseline where the smaller is progressive?**
+   Progressive encodes the *same* image 5–10% smaller. Letting bytes decide
+   there rewards the less efficient encoder — the identical mistake as ranking
+   a JPEG export above the camera's HEIC.
+
+Nothing here is a second read: `scan` already runs `exiftool -fast2` over
+every original for date candidates, and quality and encoding mode come off
+the same JPEG header in the same pass.
+
+The tolerance on rung 1 exists for the same reason format outranks size. A
+raw converter trims a few pixels of sensor edge, so the camera's JPEG
+routinely out-measures the DNG of the very same frame — 5216×3472 against
+5212×3468, 0.19% more pixels. Compared exactly, that rounding error knocks
+the raw out on the *first* rung, format never gets a say, and a 12 MB JPEG
+beats a 35 MB raw original. Anything genuinely downscaled is orders of
+magnitude outside the band and still loses outright. When a keeper does win
+with fewer pixels than a rival, the review page says so and names the gap,
+rather than claiming a resolution they didn't have.
+
+A date never outranks image quality; it only replaces what used to be a coin
+flip. On a 47k-tranche plan that moved arbitrary UUID picks from 20% of
+tranches to under 2%.
+
+**All dates are wall clock at the capture location**, not the machine's
+current timezone — Photos stores an instant plus the capture UTC offset while
+EXIF stores a bare wall clock, so rendering Photos dates locally made the two
+disagree by the travel offset and caused spurious "corrections". Written dates
+carry the asset's own offset so the correct instant is restored.
+
+The **merged date** is the oldest *plausible* timestamp found anywhere in the
+tranche. Candidates are every member's Photos date, its file's EXIF/QuickTime
+dates via exiftool, and **any timestamp embedded in the filename** —
+`webcam23 - 2004-02-22 18-07-14.jpg` is capture metadata that survives
+re-imports which trash the Photos date. 13% of this library's filenames carry
+one, and they agree with EXIF exactly 76% of the time; where they disagree the
+oldest-plausible rule sorts it out, so a Flickr export stamp loses to older
+EXIF while a filename rescues a tranche whose EXIF reads 2017 for a 2006
+shoot. Epoch placeholders, pre-1990 and future dates are excluded but shown.
+Same inputs, same answer, every time. The
+`date-spread` warning fires only when **EXIF/QuickTime candidates disagree
+with each other** — duplicates re-imported on different days routinely carry
+different Photos dates, and silently fixing that is the tool's job, not a
+reason for scrutiny.
+
+`review` renders a static HTML gallery: members side by side with thumbnails,
+every date candidate (implausible ones struck through), czkawka verification
+tier per tranche (`exact` / `visual-0` / `near` / `video` / `partial` /
+`unverified` — the last two are Apple-only claims czkawka could not confirm,
+so look closely).
+
+Every tier asks whether evidence of **its own kind** links the whole tranche
+into one connected piece. A perceptual distance describes the stills it was
+measured between, so a member reached only by a video match cannot inherit
+one — such a tranche caps at `video`. Two verified pairs bridged by a single
+edge of a different kind are `partial`, not one verified group: copies of one
+photo all land in a single czkawka group, so two disjoint groups mean czkawka
+sees two different photos. This matters most for Live Photos, whose ~2-second
+motion clips are hashed too: a clip-to-clip match between two Live Photos is
+never on its own reason to call them the same photo (czkawka's video hash is
+unreliable at that length), so it no longer groups them, and
+`--video-tolerance` defaults to 5 rather than czkawka's 10. A clip matching a
+**standalone video** still counts — there the match rests on a file the asset
+actually shows.
+
+Approve/reject per tranche or in bulk, click anywhere on a
+member card to make it the keeper, then *Export decisions* — the downloaded
+`decisions.json` is what `apply` executes. Vim-style keys throughout
+(`?` shows the map): `j`/`k`/`gg`/`G` navigate, `a`/`x` approve/reject and
+advance, `u` clears, `n` jumps to the next undecided, `h`/`l` cycle the
+keeper, `o` reveals the keeper in Photos.app. Reveal needs
+`review --serve` (127.0.0.1, default port 8942), which adds per-member
+*Photos* buttons backed by a `/reveal` endpoint (AppleScript `spotlight`,
+uuids validated against the plan). In server mode *Export decisions* saves
+straight into the out dir as `decisions-YYYYMMDD-HHMMSS.json` and refreshes
+a stable `decisions.json` (opened as `file://` it downloads instead).
+scan/plan/review never modify the library.
+
+```sh
+make -C merge-helper                       # build the PhotoKit helper (once)
+osxphotos run dedupe_photos.py apply --decisions ~/Downloads/decisions.json
+osxphotos run dedupe_photos.py apply --decisions ~/Downloads/decisions.json --apply
+osxphotos run dedupe_photos.py verify --decisions ~/Downloads/decisions.json
+```
+
+`apply` executes only approved tranches, dry-run by default, in a
+safety-ordered sequence: album/keyword/title transfer to the keeper via
+photoscript (Photos running; `--skip-photoscript` to forgo), then merged
+dates + favorites via `merge-helper` (PhotoKit `PHAssetChangeRequest` — the
+supported change API, so edits sync to iCloud like hand edits), then keeper
+dates are **re-verified against the live database**, and only then losers are
+deleted through **one** batched PhotoKit call — a single system confirmation
+dialog for the whole run, everything into Recently Deleted (30-day recovery).
+Every member is re-validated against the live library first; tranches whose
+members changed since the plan, or whose metadata transfer failed, are held
+back and retried next run. Each apply writes an `apply-log-*.json` undo
+record (old dates, deleted uuids; date changes are also revertible with
+`osxphotos timewarp --reset`). `verify` reports per-tranche completeness and
+exits nonzero while anything is pending.
+
+**WAL caveat:** the default scan reader loads the library via osxphotos,
+which copies `Photos.sqlite` *and its write-ahead log* to a temp dir. After a
+huge import the WAL can be enormous (143 GB here), so scan refuses that
+reader above `--max-wal-gb` (default 2). Quit Photos and everything else
+holding the database (Messages, widgets — reopening Photos once, or a reboot,
+lets macOS checkpoint), or use `--reader sqlite`, which reads the live
+database in place at any WAL size and works mid-import, at the cost of
+albums/keywords and derivative-based (fast) thumbnails.
+
 ## flatten-photos (Swift / PhotoKit)
 
 Collapse single-album "wrapper" folders in Photos.app. For a hierarchy like
