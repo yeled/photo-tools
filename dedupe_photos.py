@@ -2357,7 +2357,7 @@ kbd { font: 12px ui-monospace, monospace; padding: 0 5px; border-radius: 4px;
 <tr><td>click a date</td><td>use it as the tranche's merged date</td></tr>
 <tr><td><kbd>?</kbd></td><td>toggle this help</td></tr>
 <tr><td colspan="2" style="padding-top:8px;opacity:.75">
-keeper: resolution → format (RAW&gt;HEIC&gt;PNG&gt;JPEG) → file size
+keeper: resolution → format (RAW&gt;HEIC&gt;PNG/TIFF&gt;JPEG) → file size
 within that format (differences under 1% count as equal) →
 oldest date → shortest filename → first imported → UUID.
 A smaller HEIC still wins: it is ~2x more efficient than JPEG.</td></tr>
