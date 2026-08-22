@@ -185,11 +185,12 @@ answer to "why this one?" is always on screen.
 | --- | --- | --- |
 | 1 | **Resolution** | Most pixels wins outright — but only when **material**: differences under `--pixel-tolerance-pct` (1%) count as a tie. |
 | 2 | **Format** | RAW > HEIC > PNG/TIFF > JPEG. A file below `--format-floor-pct` (25%) of the biggest same-resolution file forfeits this, so a degraded re-encode can't win on its extension. |
-| 3 | **File size** | Only *within* the surviving format, and only when **material**: differences under `--size-tolerance-pct` (1%) count as a tie. |
-| 4 | **Oldest timestamp** | The oldest *plausible* capture time — the original, not a re-import whose date drifted. |
-| 5 | **Shortest filename** | `IMG_1234.tif` beats `IMG_1234-2.tif`; suffixes mark copies and re-saves. |
-| 6 | **Earliest import** | Library bookkeeping, so it ranks below anything about the photo itself. |
-| 7 | **UUID** | Deterministic backstop. When a tranche gets this far the pick really is arbitrary, and the page says so. |
+| 3 | **Original over render** | `IMG_5169.MOV` beats `IMG_5169_edited.mov`. An edit re-encodes at Photos' own bitrate and comes out *bigger*, so this has to outrank size or bytes crown the derivative. |
+| 4 | **File size** | Only *within* the surviving format, and only when the gap can carry the weight — see below. |
+| 5 | **Oldest timestamp** | The oldest *plausible* capture time — the original, not a re-import whose date drifted. |
+| 6 | **Shortest filename** | `IMG_1234.tif` beats `IMG_1234-2.tif`; suffixes mark copies and re-saves. |
+| 7 | **Earliest import** | Library bookkeeping, so it ranks below anything about the photo itself. |
+| 8 | **UUID** | Deterministic backstop. When a tranche gets this far the pick really is arbitrary, and the page says so. |
 
 Two rungs are counter-intuitive and deliberate. **Format outranks size**
 because bytes only measure quality *within* one codec: HEVC is roughly 2×
@@ -198,6 +199,38 @@ size — ranking by bytes keeps the JPEG export over the camera's own HEIC
 original, discarding 10-bit colour, depth maps and HDR gain maps for a
 derived 8-bit copy. And **filename outranks import order**, because which
 copy landed in the library first is noise, while a `-2` suffix is evidence.
+
+### When file size is allowed to decide
+
+Size is a *proxy* for quality, and a coarse one. Measured against exiftool's
+JPEG quality estimate across ~600 tranches of this library — "did the bigger
+file actually hold a better picture?" — the proxy is worthless at the small
+end and reliable at the large end:
+
+| gap (bytes/px) | size wins on **noise** | real quality win |
+| --- | --- | --- |
+| < 0.0025 | **96–100%** | 0–4% |
+| 0.0025 – 0.04 | ~60% | ~40% |
+| > 0.16 | 21% | **79%** |
+
+So the rung asks three questions before eliminating anyone, and stays silent
+if any of them says the bytes aren't evidence:
+
+1. **Is the gap above `--size-gap-bpp` (0.0025 bytes/px)?** A percentage
+   cannot tell 8% of 20 KB from 8% of 20 MB. 4 KB on a 1.9 MP image is
+   nothing; the same 4 KB on a 640×480 thumbnail is nothing too.
+2. **Do the files have equal measured JPEG quality?** Then the bytes differ
+   for some reason that isn't the picture. Where exiftool can read the
+   quantization tables (about 3 in 4 of this library's JPEGs) the real
+   measurement overrides the proxy.
+3. **Is the bigger file merely baseline where the smaller is progressive?**
+   Progressive encodes the *same* image 5–10% smaller. Letting bytes decide
+   there rewards the less efficient encoder — the identical mistake as ranking
+   a JPEG export above the camera's HEIC.
+
+Nothing here is a second read: `scan` already runs `exiftool -fast2` over
+every original for date candidates, and quality and encoding mode come off
+the same JPEG header in the same pass.
 
 The tolerance on rung 1 exists for the same reason format outranks size. A
 raw converter trims a few pixels of sensor edge, so the camera's JPEG

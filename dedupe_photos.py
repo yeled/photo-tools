@@ -27,18 +27,22 @@ afterwards. apply without --apply is a dry run.
 The merge plan fixes what Apple's own Merge button gets wrong:
 
   * KEEPER (which pixels survive) is chosen by resolution, then format
-    (RAW > HEIC > PNG/TIFF > JPEG), then file size -- but neither pixels nor
-    bytes count unless the difference is MATERIAL. A few bytes of metadata
-    padding on a multi-megabyte file says nothing about which copy is better
-    (--size-tolerance-pct, default 1%), and neither do the four pixels of
-    sensor edge by which a camera's JPEG out-measures the DNG of the very same
-    frame (--pixel-tolerance-pct, default 1%) -- compared exactly, that
-    rounding error hands the group to the JPEG. Copies within those bands are
-    equal quality, so the ladder moves on to the oldest timestamp, then the
-    shortest filename (suffixes like "-2" mark copies and re-saves), then the
-    earliest import, then UUID. So the original beats a re-import whose date
-    drifted, while a genuinely bigger or higher-resolution file still wins
-    outright.
+    (RAW > HEIC > PNG/TIFF > JPEG), then original-over-"_edited"-render, then
+    file size -- but neither pixels nor bytes count unless the difference is
+    MATERIAL. Four pixels of sensor edge, by which a camera's JPEG
+    out-measures the DNG of the very same frame, are not a resolution win
+    (--pixel-tolerance-pct, default 1%). And file size is only a PROXY for
+    quality: it must clear both --size-tolerance-pct (default 1%) and
+    --size-gap-bpp (default 0.0025 bytes per pixel), because a percentage
+    alone cannot tell 8% of 20 KB from 8% of 20 MB. Where exiftool can read
+    the real JPEG quality, that measurement overrides the proxy: equal quality
+    means the bytes differ for some other reason, and a baseline JPEG never
+    beats a progressive one on size alone (progressive encodes the same
+    picture ~5-10% smaller). Copies that tie there fall through to the oldest
+    timestamp, then the shortest filename (suffixes like "-2" mark copies and
+    re-saves), then the earliest import, then UUID. So the original beats a
+    re-import whose date drifted, while a genuinely bigger or higher-resolution
+    file still wins outright.
   * ALL DATES ARE WALL CLOCK AT THE CAPTURE LOCATION, never the machine's
     current zone. Photos stores an absolute instant plus the capture UTC
     offset; EXIF stores a bare wall clock with no zone at all. Rendering the
@@ -178,6 +182,19 @@ DEFAULT_PIXEL_TOL_PCT = 1.0
 # smaller HEIC is normal and must still win; but a file far below even that
 # is a degraded re-encode and forfeits its format advantage.
 DEFAULT_FORMAT_FLOOR_PCT = 25.0
+# A size difference must clear this many bytes PER PIXEL to count as evidence.
+# A percentage alone cannot tell 8.5% of 20 KB from 8.5% of 20 MB, and the
+# small end is where it goes wrong: measured against exiftool's JPEG quality
+# estimate over ~600 tranches of this library, a gap below 0.0025 bytes/px was
+# the same picture 96-100% of the time. Above ~0.04 the bigger file really is
+# the better one 60-80% of the time, so the rung keeps its teeth where it has
+# any resolving power.
+DEFAULT_SIZE_GAP_BPP = 0.0025
+# Progressive JPEG encodes the SAME image about 5-10% smaller than baseline.
+# Inside this band a size difference between the two modes says nothing about
+# the picture, so bytes must not decide -- the same reasoning that puts format
+# above size. Beyond it the gap is too big for encoding alone to explain.
+DEFAULT_ENCODING_GAP_PCT = 15.0
 DEFAULT_SPREAD_WARN_DAYS = 2.0
 DEFAULT_THUMB_PX = 768
 
@@ -304,6 +321,33 @@ def is_suspect_date(dt: datetime, min_year: int, now: datetime) -> bool:
     return False
 
 
+_EDITED_RE = re.compile(r"_edited(?:-\d+)?$", re.IGNORECASE)
+
+
+def is_derivative(filename: Optional[str]) -> bool:
+    """True for Photos' rendered edit of another asset ("IMG_5169_edited.mov").
+
+    A "-2" suffix means someone made a copy; "_edited" means the pixels are a
+    RENDER of someone else's, which is why this ranks above size instead of
+    with the filename tiebreak. The render is routinely the bigger file -- an
+    edit re-encodes at Photos' own bitrate -- so bytes alone hand it the win
+    over the original it was derived from."""
+    stem = os.path.splitext(filename or "")[0]
+    return bool(_EDITED_RE.search(stem))
+
+
+def jpeg_quality(m: dict) -> Optional[int]:
+    """exiftool's quality estimate from the quantization tables, or None when
+    it could not map them (it reports the string "<unknown>")."""
+    v = (m.get("exif") or {}).get("JPEGQualityEstimate")
+    return int(v) if isinstance(v, (int, float)) else None
+
+
+def jpeg_encoding(m: dict) -> Optional[str]:
+    v = (m.get("exif") or {}).get("EncodingProcess")
+    return v if isinstance(v, str) and v not in ("-", "") else None
+
+
 def format_rank(ext: str) -> int:
     ext = ext.lower().lstrip(".")
     for exts, rank in _FORMAT_RANKS:
@@ -338,24 +382,64 @@ def oldest_plausible(m: dict, min_year: int, now: datetime) -> datetime:
     return min(cands) if cands else datetime.max
 
 
+def size_veto(pool: List[dict], losers: List[dict],
+              size_gap_bpp: float = DEFAULT_SIZE_GAP_BPP,
+              encoding_gap_pct: float = DEFAULT_ENCODING_GAP_PCT
+              ) -> Optional[str]:
+    """Why the byte count is not evidence here, or None if it is.
+
+    File size is a PROXY for image quality, and a coarse one. These three
+    checks ask whether the proxy has any resolving power before letting it
+    eliminate anybody; where exiftool could read the real quality, they defer
+    to the measurement instead of the guess."""
+    top = max(pool, key=lambda m: m.get("size") or 0)
+    rival = max(losers, key=lambda m: m.get("size") or 0)
+    tsize, rsize = (top.get("size") or 0), (rival.get("size") or 0)
+    px = max(_pixels(m) for m in pool) or 1
+
+    if (tsize - rsize) / px < size_gap_bpp:
+        return (f"{(tsize - rsize) / px:.4f} bytes/px apart, below the "
+                f"{size_gap_bpp:g} needed to mean anything")
+
+    # Where the real quality is readable for everyone, it outranks the proxy.
+    quals = [jpeg_quality(m) for m in pool]
+    if all(q is not None for q in quals) and len(set(quals)) == 1:
+        return f"identical JPEG quality ({quals[0]}), so the bytes differ elsewhere"
+
+    # Progressive is ~5-10% smaller than baseline for the same picture. Only
+    # veto inside that band, and only when quality does not say otherwise.
+    tenc, renc = jpeg_encoding(top), jpeg_encoding(rival)
+    tq, rq = jpeg_quality(top), jpeg_quality(rival)
+    gap_pct = (tsize - rsize) / tsize * 100 if tsize else 0.0
+    if (tenc and renc and tenc != renc and gap_pct <= encoding_gap_pct
+            and "Baseline" in tenc and "Progressive" in renc
+            and not (tq is not None and rq is not None and tq > rq)):
+        return (f"{gap_pct:.1f}% bigger only because it is {tenc.strip()} "
+                f"against {renc.strip()}, which encodes the same picture smaller")
+    return None
+
+
 def keeper_pool(members: List[dict], size_tol_pct: float,
                 format_floor_pct: float,
-                pixel_tol_pct: float = DEFAULT_PIXEL_TOL_PCT
+                pixel_tol_pct: float = DEFAULT_PIXEL_TOL_PCT,
+                size_gap_bpp: float = DEFAULT_SIZE_GAP_BPP
                 ) -> Tuple[List[dict], str]:
-    """Narrow to the best-quality candidates, returning them and the rung
-    that last narrowed the field ("resolution", "format", "size", "" if the
-    group never narrowed).
+    """Narrow to the best-quality candidates, returning them and the rung that
+    last narrowed the field ("resolution", "format", "derivative", "size", ""
+    if the group never narrowed).
 
     Resolution leads, but only a MATERIAL difference counts (outside
     pixel_tol_pct of the biggest). A raw file and the camera's JPEG of the
     same frame differ by a few pixels of sensor edge; treating that as "lower
     resolution" would eliminate the raw before format is ever judged.
 
-    Order matters after that: FORMAT is judged before size, because bytes only
-    measure quality within one codec. HEIC is about twice as efficient as
-    JPEG, so the same picture is roughly half the size as HEIC -- comparing
-    the two by byte count picks the JPEG export over the camera's own original
-    every time. Size then compares like with like."""
+    Everything after that is arranged so the coarsest evidence is judged
+    first. FORMAT beats size because bytes only measure quality within one
+    codec: HEIC is ~2x more efficient than JPEG, so byte-ranking picks the
+    JPEG export over the camera's own original every time. DERIVATIVE beats
+    size for the same reason in reverse -- an "_edited" render is usually
+    LARGER than the original it came from. SIZE goes last and, per size_veto,
+    only when the byte difference can carry the weight."""
     pool, why = list(members), ""
 
     pix_floor = max(_pixels(m) for m in pool) * (1 - pixel_tol_pct / 100.0)
@@ -375,10 +459,19 @@ def keeper_pool(members: List[dict], size_tol_pct: float,
         why = "format"
     pool = [m for m in pool if rank(m) == best_rank]
 
+    # An "_edited" render loses to the original it was rendered from, and it
+    # has to be judged BEFORE size: re-encoding at Photos' own bitrate makes
+    # the derivative the bigger file, so bytes would hand it the win.
+    if any(is_derivative(m.get("filename")) for m in pool) and \
+            not all(is_derivative(m.get("filename")) for m in pool):
+        why = "derivative"
+        pool = [m for m in pool if not is_derivative(m.get("filename"))]
+
     threshold = max((m.get("size") or 0) for m in pool) * (1 - size_tol_pct / 100.0)
-    if any((m.get("size") or 0) < threshold for m in pool):
+    losers = [m for m in pool if (m.get("size") or 0) < threshold]
+    if losers and not size_veto(pool, losers, size_gap_bpp):
         why = "size"
-    pool = [m for m in pool if (m.get("size") or 0) >= threshold]
+        pool = [m for m in pool if (m.get("size") or 0) >= threshold]
     return pool, why
 
 
@@ -387,7 +480,8 @@ def choose_keeper(members: List[dict],
                   now: Optional[datetime] = None,
                   size_tol_pct: float = DEFAULT_SIZE_TOL_PCT,
                   format_floor_pct: float = DEFAULT_FORMAT_FLOOR_PCT,
-                  pixel_tol_pct: float = DEFAULT_PIXEL_TOL_PCT) -> str:
+                  pixel_tol_pct: float = DEFAULT_PIXEL_TOL_PCT,
+                  size_gap_bpp: float = DEFAULT_SIZE_GAP_BPP) -> str:
     """Resolution first, then format, then file size -- but neither pixels nor
     bytes count unless the difference is MATERIAL (outside pixel_tol_pct /
     size_tol_pct of the biggest). Copies within those bands are treated as
@@ -402,7 +496,8 @@ def choose_keeper(members: List[dict],
     ABOVE import date for the same reason -- import order inside one batch is
     bookkeeping noise, while a "-2" suffix is real evidence of a copy."""
     now = now or datetime.now()
-    pool, _ = keeper_pool(members, size_tol_pct, format_floor_pct, pixel_tol_pct)
+    pool, _ = keeper_pool(members, size_tol_pct, format_floor_pct, pixel_tol_pct,
+                          size_gap_bpp)
 
     def key(m: dict):
         return (
@@ -449,7 +544,8 @@ def keeper_reason(members: List[dict], keeper: str,
                   now: Optional[datetime] = None,
                   size_tol_pct: float = DEFAULT_SIZE_TOL_PCT,
                   format_floor_pct: float = DEFAULT_FORMAT_FLOOR_PCT,
-                  pixel_tol_pct: float = DEFAULT_PIXEL_TOL_PCT) -> str:
+                  pixel_tol_pct: float = DEFAULT_PIXEL_TOL_PCT,
+                  size_gap_bpp: float = DEFAULT_SIZE_GAP_BPP) -> str:
     """Explain in one phrase which rule made this member the keeper.
 
     Mirrors choose_keeper's ladder exactly (resolution -> bytes -> format ->
@@ -465,15 +561,22 @@ def keeper_reason(members: List[dict], keeper: str,
     dims = _dims(k)
     ksize = k.get("size") or 0
 
-    # Mirrors keeper_pool's order exactly: resolution, then format, then size.
-    # Each message says "of the N tied" rather than "identical" -- claiming
-    # members matched on a rung they were already eliminated on was misleading.
+    # Mirrors keeper_pool's order exactly: resolution, format, derivative,
+    # size. Each message says "of the N tied" rather than "identical" --
+    # claiming members matched on a rung they were already eliminated on was
+    # misleading.
     pool, rung = keeper_pool(members, size_tol_pct, format_floor_pct,
-                             pixel_tol_pct)
+                             pixel_tol_pct, size_gap_bpp)
     res = _res_phrase(members, k, pixel_tol_pct)
     quality = ""
     if rung == "resolution":
         quality = f"highest resolution ({dims})"
+    elif rung == "derivative":
+        beaten = sorted({m.get("filename") or "?" for m in members
+                         if is_derivative(m.get("filename"))})
+        quality = (f"the original, not a render ({', '.join(beaten)} "
+                   f"{'is an' if len(beaten) == 1 else 'are'} edited "
+                   f"derivative{'' if len(beaten) == 1 else 's'})")
     elif rung == "format":
         beaten = sorted({(m.get("ext") or "?") for m in members
                          if m["uuid"] != k["uuid"]
@@ -511,6 +614,16 @@ def keeper_reason(members: List[dict], keeper: str,
     lost = len(members) - len(pool)
     tail = (f"; {lost} lower-quality {'copy' if lost == 1 else 'copies'} "
             "dropped first" if lost else "")
+
+    # When the biggest file did NOT win, say why the byte count was set aside.
+    # Otherwise the page shows a keeper the reviewer can see is smaller than a
+    # rival and offers no account of it -- the same complaint that a keeper
+    # with fewer pixels drew.
+    thr = max((m.get("size") or 0) for m in pool) * (1 - size_tol_pct / 100.0)
+    outsized = [m for m in pool if (m.get("size") or 0) < thr]
+    veto = size_veto(pool, outsized, size_gap_bpp) if outsized else None
+    if veto:
+        tail += f"; size ignored ({veto})"
     n = len(rivals) + 1
 
     rivals, kbest = narrow(rivals, lambda m: oldest_plausible(m, min_year, now))
@@ -1249,7 +1362,15 @@ def run_exiftool(members: Dict[str, dict], out_dir: Path, verbose: Callable) -> 
     UTC timestamps in the timezone of whatever machine runs exiftool, so the
     same .mov read differently in London and New York. Values come back as
     stored and normalize_quicktime_utc() converts the UTC ones using each
-    asset's own capture offset."""
+    asset's own capture offset.
+
+    JPEGQualityEstimate and EncodingProcess ride along for the keeper ladder:
+    they are what turn "bigger file" from a guess into a measurement. Both
+    come from the JPEG header, so -fast2 already has them in hand and this
+    costs no extra read. Quality resolves for about 3 in 4 of this library's
+    JPEGs -- the rest use quantization tables exiftool cannot map back to a
+    quality number and report "<unknown>", so the ladder treats it as absent
+    rather than assuming anything."""
     exiftool = shutil.which("exiftool")
     if not exiftool:
         verbose("exiftool not found on PATH; skipping EXIF date candidates")
@@ -1264,6 +1385,7 @@ def run_exiftool(members: Dict[str, dict], out_dir: Path, verbose: Callable) -> 
         [exiftool, "-j", "-f", "-fast2",
          "-d", "%Y-%m-%dT%H:%M:%S%z",
          "-DateTimeOriginal", "-CreateDate", "-CreationDate",
+         "-JPEGQualityEstimate", "-EncodingProcess",
          "-@", str(listfile)],
         capture_output=True, text=True)
     if proc.returncode not in (0, 1) or not proc.stdout.strip():
@@ -1275,7 +1397,8 @@ def run_exiftool(members: Dict[str, dict], out_dir: Path, verbose: Callable) -> 
         uuid = paths.get(rec.get("SourceFile"))
         if uuid:
             result[uuid] = {k: rec.get(k) for k in
-                            ("DateTimeOriginal", "CreateDate", "CreationDate")}
+                            ("DateTimeOriginal", "CreateDate", "CreationDate",
+                             "JPEGQualityEstimate", "EncodingProcess")}
     return result
 
 
@@ -1631,7 +1754,8 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
                min_year: int, spread_warn_days: float,
                now: Optional[datetime] = None,
                size_tol_pct: float = DEFAULT_SIZE_TOL_PCT,
-               pixel_tol_pct: float = DEFAULT_PIXEL_TOL_PCT) -> dict:
+               pixel_tol_pct: float = DEFAULT_PIXEL_TOL_PCT,
+               size_gap_bpp: float = DEFAULT_SIZE_GAP_BPP) -> dict:
     """Deterministic: no timestamps, stable ordering, so identical inputs
     produce byte-identical plan.json."""
     now = now or datetime.now()
@@ -1645,7 +1769,8 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
         m_date, source, spread, warnings = merged_date(
             ms, min_year, now, spread_warn_days)
         keeper = choose_keeper(ms, min_year, now, size_tol_pct,
-                               DEFAULT_FORMAT_FLOOR_PCT, pixel_tol_pct)
+                               DEFAULT_FORMAT_FLOOR_PCT, pixel_tol_pct,
+                               size_gap_bpp)
         for m in ms:
             for flag in m["flags"]:
                 if flag in VISIBILITY_FLAGS:
@@ -1686,7 +1811,7 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
             "keeper_reason": keeper_reason(ms, keeper, min_year, now,
                                            size_tol_pct,
                                            DEFAULT_FORMAT_FLOOR_PCT,
-                                           pixel_tol_pct),
+                                           pixel_tol_pct, size_gap_bpp),
             "merged_date": m_date,
             "date_source": source,
             "date_spread_days": spread,
@@ -1749,10 +1874,14 @@ def build_plan(scan: dict, dup_groups, image_groups, video_groups,
         "policy": {
             "keeper": (f"pixels desc (ties within {pixel_tol_pct:g}% count as "
                        "equal), format rank (RAW>HEIC>PNG/TIFF>JPEG), "
-                       f"file size within the surviving format (ties within "
-                       f"{size_tol_pct:g}% count as equal), oldest timestamp, "
-                       "shortest filename, earliest import, uuid"),
+                       "original over _edited render, file size within the "
+                       f"surviving format (ties within {size_tol_pct:g}% or "
+                       f"under {size_gap_bpp:g} bytes/px count as equal, and "
+                       "bytes never decide against equal measured JPEG quality "
+                       "or a progressive/baseline difference), oldest "
+                       "timestamp, shortest filename, earliest import, uuid"),
             "size_tolerance_pct": size_tol_pct,
+            "size_gap_bytes_per_pixel": size_gap_bpp,
             "pixel_tolerance_pct": pixel_tol_pct,
             "format_floor_pct": DEFAULT_FORMAT_FLOOR_PCT,
             "date": "oldest plausible candidate across tranche",
@@ -1810,7 +1939,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
     plan = build_plan(scan, dup_groups, image_groups, video_groups,
                       args.min_plausible_year, args.date_spread_warn_days,
                       size_tol_pct=args.size_tolerance_pct,
-                      pixel_tol_pct=args.pixel_tolerance_pct)
+                      pixel_tol_pct=args.pixel_tolerance_pct,
+                      size_gap_bpp=args.size_gap_bpp)
     (out_dir / "plan.json").write_text(json.dumps(plan, indent=1, sort_keys=True))
     for kind in ("keepers", "losers"):
         (out_dir / f"{kind}.txt").write_text(
@@ -3495,6 +3625,12 @@ def add_plan_args(p: argparse.ArgumentParser) -> None:
                    "beaten by the JPEG's few extra pixels of sensor edge "
                    f"(default {DEFAULT_PIXEL_TOL_PCT:g}; 0 compares exact "
                    "pixels)")
+    p.add_argument("--size-gap-bpp", type=float,
+                   default=DEFAULT_SIZE_GAP_BPP, metavar="BPP",
+                   help="a size difference must clear this many bytes PER "
+                   "PIXEL to count; a percentage cannot tell 8%% of 20 KB "
+                   f"from 8%% of 20 MB (default {DEFAULT_SIZE_GAP_BPP:g}; "
+                   "0 lets any percentage difference decide)")
 
 
 def add_review_args(p: argparse.ArgumentParser) -> None:
@@ -3576,6 +3712,8 @@ examples:
                        default=DEFAULT_SIZE_TOL_PCT)
     p_all.add_argument("--pixel-tolerance-pct", type=float,
                        default=DEFAULT_PIXEL_TOL_PCT)
+    p_all.add_argument("--size-gap-bpp", type=float,
+                       default=DEFAULT_SIZE_GAP_BPP)
     p_all.add_argument("--open", action="store_true")
     p_all.add_argument("--thumb-size", type=int, default=DEFAULT_THUMB_PX)
     p_all.add_argument("--skip-thumbs", action="store_true")
@@ -3808,13 +3946,23 @@ def selftest() -> None:
     big = _member("K1", "big.jpg", w=4000, h=3000, size=100)
     small = _member("K2", "small.jpg", w=100, h=100, size=999)
     assert "highest resolution (4000x3000)" == keeper_reason([big, small], "K1")
-    # the screenshot case: same pixels, same format, larger file wins
+    # The screenshot case, REVISED. 324300 vs 328294 is 1.2% apart, which
+    # clears the size tolerance -- but it is 0.0021 bytes/px, and measured
+    # against exiftool's quality estimate over ~600 tranches of the real
+    # library, gaps that small were the same picture 96-100% of the time.
+    # 4 KB on a 1.9 MP image is not evidence, so size stays silent and the
+    # ladder falls through (here to filename, a.jpg before b.jpg).
     a = _member("K3", "a.jpg", w=1200, h=1600, size=324300)
     b = _member("K4", "b.jpg", w=1200, h=1600, size=328294)
-    # 324300 vs 328294 is 1.2% apart -- a material difference, size still wins
-    assert choose_keeper([a, b], 1990, now) == "K4"
-    why = keeper_reason([a, b], "K4", 1990, now)
-    assert why.startswith("materially larger file (") and "1200x1600" in why, why
+    assert choose_keeper([a, b], 1990, now) == "K3"
+    why = keeper_reason([a, b], "K3", 1990, now)
+    assert "size ignored" in why and "below the 0.0025" in why, why
+    # size still decides when the gap is big enough to mean something
+    a2 = _member("K3", "a.jpg", w=1200, h=1600, size=324300)
+    b2 = _member("K4", "b.jpg", w=1200, h=1600, size=560000)
+    assert choose_keeper([a2, b2], 1990, now) == "K4"
+    why2 = keeper_reason([a2, b2], "K4", 1990, now)
+    assert why2.startswith("materially larger file (") and "1200x1600" in why2, why2
 
     # A HANDFUL OF BYTES on a 320 KB file must NOT beat an older date: within
     # tolerance the sizes count as equal, so the ladder falls through to date.
@@ -3825,8 +3973,13 @@ def selftest() -> None:
     assert choose_keeper([tiny_bigger, older], 1990, now) == "ZZZ-OLDER"
     why_old = keeper_reason([tiny_bigger, older], "ZZZ-OLDER", 1990, now)
     assert why_old.startswith("oldest timestamp (2006-09-23T09:54:00)"), why_old
-    # ...and with the tolerance switched off, exact bytes win again
-    assert choose_keeper([tiny_bigger, older], 1990, now, 0.0) == "AAA-NEWER"
+    # Switching the PERCENTAGE tolerance off is no longer enough to resurrect
+    # a 9-byte difference: at 0.0000047 bytes/px the per-pixel floor still
+    # catches it. Two independent guards, and the weaker one cannot unlock
+    # the stronger. Both off, and exact bytes win again.
+    assert choose_keeper([tiny_bigger, older], 1990, now, 0.0) == "ZZZ-OLDER"
+    assert choose_keeper([tiny_bigger, older], 1990, now, 0.0,
+                         size_gap_bpp=0.0) == "AAA-NEWER"
 
     heic = _member("K5", "c.heic", w=1200, h=1600, size=328294)
     assert keeper_reason([b, heic], "K5", 1990, now).startswith("better format (.heic")
@@ -3900,11 +4053,66 @@ def selftest() -> None:
     # keeper_pool reports which rung last narrowed the field
     assert keeper_pool([big, small], 1.0, 25.0)[1] == "resolution"
     assert keeper_pool([export_jpg, iphone_heic], 1.0, 25.0)[1] == "format"
-    assert keeper_pool([a, b], 1.0, 25.0)[1] == "size"
+    assert keeper_pool([a2, b2], 1.0, 25.0)[1] == "size"
+    assert keeper_pool([a, b], 1.0, 25.0)[1] == ""   # gap too small to count
     assert keeper_pool([plain, suffixed], 1.0, 25.0)[1] == ""
     # a sub-tolerance pixel gap does not count as a narrowing at all
     assert keeper_pool([cam_jpg, cam_dng], 1.0, 25.0)[1] == "format"
     assert keeper_pool([cam_jpg, cam_dng], 1.0, 25.0, 0.0)[1] == "resolution"
+
+    # TRANCHE #46: three 640x480 thumbnails. The 20.0 KB copy is Baseline and
+    # the 18.3 KB ones Progressive, which encodes the SAME picture ~5-10%
+    # smaller -- the entire 8.5% gap. Bytes must not hand the win to the less
+    # efficient encoder, the same rule that puts format above size.
+    def _jpeg(uuid, name, size, enc, qual=None, date="2003-04-10T17:06:08"):
+        m = _member(uuid, name, w=640, h=480, size=size, photos_date=date)
+        m["exif"] = {"EncodingProcess": enc, "JPEGQualityEstimate": qual}
+        return m
+    baseline = _jpeg("AAA-BASE", "sexy suave lustful.jpg", 20440,
+                     "Baseline DCT, Huffman coding", date="2004-12-20T16:59:44")
+    prog = _jpeg("ZZZ-PROG", "L1000128.jpg", 18692, "Progressive DCT, Huffman coding")
+    assert choose_keeper([baseline, prog], 1990, now) == "ZZZ-PROG"
+    why46 = keeper_reason([baseline, prog], "ZZZ-PROG", 1990, now)
+    assert "size ignored" in why46 and "Progressive" in why46, why46
+    # ...but a gap too large for encoding mode to explain is still real
+    fat = _jpeg("AAA-BASE", "big.jpg", 60000, "Baseline DCT, Huffman coding",
+                date="2004-12-20T16:59:44")
+    assert choose_keeper([fat, prog], 1990, now) == "AAA-BASE"
+    # ...and when quality says the baseline file IS better, bytes stand
+    goodbase = _jpeg("AAA-BASE", "good.jpg", 20440, "Baseline DCT, Huffman coding",
+                     qual=92, date="2004-12-20T16:59:44")
+    lowprog = _jpeg("ZZZ-PROG", "low.jpg", 18692, "Progressive DCT, Huffman coding",
+                    qual=60)
+    assert choose_keeper([goodbase, lowprog], 1990, now) == "AAA-BASE"
+    # equal measured quality means the bytes differ for some other reason
+    q80a = _jpeg("AAA-NEW", "a.jpg", 20440, "Baseline DCT, Huffman coding", qual=80,
+                 date="2019-01-01T00:00:00")
+    q80b = _jpeg("ZZZ-OLD", "b.jpg", 18692, "Baseline DCT, Huffman coding", qual=80)
+    assert choose_keeper([q80a, q80b], 1990, now) == "ZZZ-OLD"
+    assert "identical JPEG quality (80)" in keeper_reason(
+        [q80a, q80b], "ZZZ-OLD", 1990, now)
+
+    # AN "_edited" RENDER LOSES TO ITS ORIGINAL, and must be judged before
+    # size: the edit re-encodes at Photos' own bitrate and comes out BIGGER,
+    # so bytes alone would crown the derivative. Both of Charlie's video
+    # overrides were exactly this.
+    edited = _member("AAA-EDIT", "IMG_5169_edited.mov", w=1080, h=1920,
+                     size=22937498, photos_date="2024-05-16T19:27:58")
+    orig = _member("ZZZ-ORIG", "IMG_5169.MOV", w=1080, h=1920,
+                   size=15467213, photos_date="2024-05-16T19:27:58")
+    assert choose_keeper([edited, orig], 1990, now) == "ZZZ-ORIG"
+    why_ed = keeper_reason([edited, orig], "ZZZ-ORIG", 1990, now)
+    assert why_ed.startswith("the original, not a render"), why_ed
+    assert "IMG_5169_edited.mov" in why_ed, why_ed
+    assert keeper_pool([edited, orig], 1.0, 25.0)[1] == "derivative"
+    assert is_derivative("IMG_5169_edited.mov")
+    assert is_derivative("IMG_9560_edited-2.heic")   # a copy OF a render
+    assert not is_derivative("IMG_5169.MOV")
+    assert not is_derivative("my_edited_photos.jpg")  # not a suffix
+    # a group of nothing but renders still has to pick one
+    edit2 = _member("ZZZ-EDIT2", "IMG_5169_edited-2.mov", w=1080, h=1920,
+                    size=22937498, photos_date="2024-05-16T19:27:58")
+    assert choose_keeper([edited, edit2], 1990, now) == "AAA-EDIT"
 
     # the real-world case: byte-identical copies, one a re-import whose date
     # drifted. The older one wins even though its UUID sorts LAST, so this
